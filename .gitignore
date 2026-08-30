@@ -1,0 +1,14 @@
+build/
+.gradle/
+local.properties
+target/
+.env
+*.log
+
+# Собирается cargo-ndk из obsidian-core, в исходниках ей не место.
+app/src/main/jniLibs/
+
+# Подпись релиза наружу не отдаётся никогда.
+*.jks
+*.keystore
+keystore.properties
