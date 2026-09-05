@@ -1,13 +1,13 @@
 [package]
-name = "obsidian-android"
+name = "valanium-android"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.80"
 publish = false
 
 [lib]
-# Имя библиотеки должно совпадать с System.loadLibrary("obsidian") в Java.
-name = "obsidian"
+# Имя библиотеки должно совпадать с System.loadLibrary("valanium") в Java.
+name = "valanium"
 crate-type = ["cdylib"]
 
 [dependencies]
@@ -15,12 +15,13 @@ crate-type = ["cdylib"]
 # клиент обязан собираться тем же ядром, которым его собрали и подписали,
 # иначе «проверьте сами» перестаёт быть проверкой. Обновление ядра —
 # отдельный осознанный коммит сюда.
-obsidian-core = { git = "https://github.com/ifny75/obsidian", rev = "27f83c47495230e064a34faba758c9f65323d4fe" }
+valanium-core = { git = "https://github.com/ifny75/valanium_main", rev = "a557f8b8b06e74da17faa4aaadcc3971d7e6939c" }
 jni = "0.21"
+hex = "0.4"
 
 [features]
 # Проброс фичи ядра: платный вход в TON по умолчанию выключен.
-ton = ["obsidian-core/ton"]
+ton = ["valanium-core/ton"]
 
 [profile.release]
 opt-level = "z"

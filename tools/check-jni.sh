@@ -12,11 +12,11 @@ work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 
 javac -d "$work/classes" -h "$work/headers" \
-    "$root/app/src/main/java/app/obsidian/core/Core.java" \
-    "$root/app/src/main/java/app/obsidian/core/Commands.java"
+    "$root/app/src/main/java/app/valanium/core/Core.java" \
+    "$root/app/src/main/java/app/valanium/core/Commands.java"
 
-header="$work/headers/app_obsidian_core_Core.h"
-symbols() { grep -o 'Java_app_obsidian_core_Core_[a-zA-Z]*' "$1" | sort -u; }
+header="$work/headers/app_valanium_core_Core.h"
+symbols() { grep -o 'Java_app_valanium_core_Core_[a-zA-Z]*' "$1" | sort -u; }
 
 symbols "$header" > "$work/java.txt"
 symbols "$root/rust/src/lib.rs" > "$work/rust.txt"

@@ -1,4 +1,4 @@
-package app.obsidian;
+package app.valanium;
 
 import android.app.Activity;
 import android.app.AlertDialog;
@@ -262,7 +262,7 @@ final class PhotoEditor {
 
         String[][] options = {{"Свободно", "0"}, {"1:1", "1"}, {"4:3", "1.3333"}, {"16:9", "1.7778"}};
         for (String[] option : options) {
-            Button button = new Button(activity, null, 0, R.style.Obsidian_Button_Dark_Small);
+            Button button = new Button(activity, null, 0, R.style.Valanium_Button_Dark_Small);
             button.setText(option[0]);
             button.setTextSize(10);
             LinearLayout.LayoutParams buttonParams =
@@ -314,7 +314,7 @@ final class PhotoEditor {
     }
 
     private Button tool(String caption, Runnable action, int leftMargin) {
-        Button button = new Button(activity, null, 0, R.style.Obsidian_Button_Dark_Small);
+        Button button = new Button(activity, null, 0, R.style.Valanium_Button_Dark_Small);
         button.setText(caption);
         button.setTextSize(10);
         LinearLayout.LayoutParams params =

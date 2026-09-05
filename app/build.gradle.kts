@@ -3,11 +3,11 @@ plugins {
 }
 
 android {
-    namespace = "app.obsidian"
+    namespace = "app.valanium"
     compileSdk = 35
 
     defaultConfig {
-        applicationId = "app.obsidian"
+        applicationId = "app.valanium"
         // 26 — минимум, где есть каналы уведомлений и нормальный foreground-сервис.
         minSdk = 26
         targetSdk = 35
@@ -39,8 +39,8 @@ android {
         jniLibs {
             // .so уже собран cargo-ndk и сжат — второй раз не надо.
             useLegacyPackaging = false
-            // JNI загружается через libobsidian.so; второй cdylib ядра не нужен.
-            excludes += "**/libobsidian_core.so"
+            // JNI загружается через libvalanium.so; второй cdylib ядра не нужен.
+            excludes += "**/libvalanium_core.so"
         }
     }
 }
@@ -56,7 +56,7 @@ dependencies {
  */
 val cargoNdk by tasks.registering(Exec::class) {
     group = "build"
-    description = "Собирает obsidian-core в jniLibs через cargo-ndk"
+    description = "Собирает valanium-core в jniLibs через cargo-ndk"
     workingDir = file("${projectDir}/../rust")
     isIgnoreExitValue = false
 

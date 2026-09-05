@@ -1,4 +1,4 @@
-package app.obsidian;
+package app.valanium;
 
 import android.content.Context;
 import android.graphics.Bitmap;

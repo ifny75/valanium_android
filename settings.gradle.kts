@@ -14,5 +14,5 @@ dependencyResolutionManagement {
     }
 }
 
-rootProject.name = "obsidian-android"
+rootProject.name = "valanium-android"
 include(":app")

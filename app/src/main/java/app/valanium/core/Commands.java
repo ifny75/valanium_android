@@ -1,8 +1,8 @@
-package app.obsidian.core;
+package app.valanium.core;
 
 /**
  * Сборка команд для ядра. Словарь общий с Windows-клиентом — он описан в
- * obsidian-core/src/command.rs, и новая возможность добавляется там.
+ * valanium-core/src/command.rs, и новая возможность добавляется там.
  *
  * <p>JSON собирается вручную, без org.json: объекты здесь плоские и заранее
  * известные, зато класс остаётся обычной Java и проверяется без эмулятора.
@@ -341,6 +341,10 @@ public final class Commands {
         StringBuilder out = new StringBuilder("{\"type\":\"pass_revoke\",\"hash\":");
         quote(out, hash);
         return out.append('}').toString();
+    }
+
+    public static String revokeOtherDevices() {
+        return "{\"type\":\"revoke_other_devices\"}";
     }
 
     private static void quoteOrNull(StringBuilder out, String value) {

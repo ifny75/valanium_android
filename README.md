@@ -1,6 +1,6 @@
-# obsidian-android
+# valanium-android
 
-Android-клиент: Java-интерфейс поверх [obsidian-core](../obsidian-core) через JNI.
+Android-клиент: Java-интерфейс поверх [valanium-core](../valanium-core) через JNI.
 
 APK собирается для `arm64-v8a` (современные физические телефоны) и использует
 то же Rust-ядро, что Windows-клиент. Проверенная portable-сборка лежит в
@@ -27,7 +27,7 @@ rustup target add aarch64-linux-android
 ./gradlew :app:assembleDebug
 ```
 
-Gradle сам вызовет `cargo ndk` и положит `libobsidian.so` в `app/src/main/jniLibs` — см. задачу `cargoNdk` в [app/build.gradle.kts](app/build.gradle.kts).
+Gradle сам вызовет `cargo ndk` и положит `libvalanium.so` в `app/src/main/jniLibs` — см. задачу `cargoNdk` в [app/build.gradle.kts](app/build.gradle.kts).
 
 При первом запуске новой установки приложение генерирует случайный 256-битный
 ключ базы, защищает его AES-GCM-ключом из Android Keystore и больше не просит
@@ -41,16 +41,16 @@ SOCKS5 Tor/Orbot на `127.0.0.1:9050`; имя `.onion` передаётся в 
 
 ```
 rust/                        JNI-обвязка: четыре функции, ~150 строк
-app/src/main/java/app/obsidian/
+app/src/main/java/app/valanium/
   core/Core.java             мост к нативной части
   core/Commands.java         сборка команд в JSON
   Events.java                события из потока опроса на главный поток
-  ObsidianService.java       foreground-сервис: держит соединение живым
+  ValaniumService.java       foreground-сервис: держит соединение живым
   LocalSecretStore.java      ключ базы поверх Android Keystore
   MainActivity.java          автовход → регистрация → переписка
 ```
 
-Словарь команд и событий общий с Windows-клиентом — он описан в [obsidian-core/README.md](../obsidian-core/README.md). Новая возможность добавляется в ядре, а не здесь.
+Словарь команд и событий общий с Windows-клиентом — он описан в [valanium-core/README.md](../valanium-core/README.md). Новая возможность добавляется в ядре, а не здесь.
 
 ### Почему опрос, а не колбэк
 
@@ -91,17 +91,23 @@ app/src/main/java/app/obsidian/
 
 ## Где остальное
 
-Obsidian разложен на четыре репозитория:
+Valanium разложен на репозитории:
 
 | Репозиторий | Что там | Лицензия |
 |---|---|---|
-| [obsidian](https://github.com/ifny75/obsidian) | ядро: криптография, MLS, протокол | AGPL-3.0 |
-| [obsidian_server](https://github.com/ifny75/obsidian_server) | сервер и конфиги узлов | AGPL-3.0 |
-| [obsidian_android](https://github.com/ifny75/obsidian_android) | клиент для Android | PolyForm Noncommercial 1.0.0 |
-| [obsidian_pc](https://github.com/ifny75/obsidian_pc) | клиент для Windows | PolyForm Noncommercial 1.0.0 |
+| [valanium_main](https://github.com/ifny75/valanium_main) | ядро: криптография, MLS, протокол | AGPL-3.0 |
+| [valanium_server](https://github.com/ifny75/valanium_server) | сервер и конфиги узлов | AGPL-3.0 |
+| [valanium_android](https://github.com/ifny75/valanium_android) | клиент для Android | PolyForm Noncommercial 1.0.0 |
+| [valanium_pc](https://github.com/ifny75/valanium_pc) | клиент для Windows | PolyForm Noncommercial 1.0.0 |
+| [valanium-onionize](https://github.com/valanium-project/valanium-onionize) | встроенный Tor для Onion | AGPL-3.0 |
+
+Ядро подключено git-зависимостью с жёстко закреплённой ревизией: клиент обязан
+собираться тем же ядром, которым его собрали и подписали.
 
 ## Лицензия
 
-**PolyForm Noncommercial 1.0.0**, см. [LICENSE.md](LICENSE.md). Код открыт для чтения, проверки и личного использования. Коммерческое использование требует отдельной договорённости.
+**PolyForm Noncommercial 1.0.0**, см. [LICENSE.md](LICENSE.md). Код открыт для
+чтения, проверки и личного использования. Коммерческое использование требует
+отдельной договорённости.
 
-Имя «Obsidian» лицензией не покрывается — см. [TRADEMARK.md](TRADEMARK.md).
+Имя «Valanium» лицензией не покрывается — см. [TRADEMARK.md](TRADEMARK.md).

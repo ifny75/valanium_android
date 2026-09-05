@@ -1101,44 +1101,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "obsidian-android"
-version = "0.1.0"
-dependencies = [
- "jni",
- "obsidian-core",
-]
-
-[[package]]
-name = "obsidian-core"
-version = "0.1.0"
-source = "git+https://github.com/ifny75/obsidian?rev=27f83c47495230e064a34faba758c9f65323d4fe#27f83c47495230e064a34faba758c9f65323d4fe"
-dependencies = [
- "argon2",
- "bip39",
- "chacha20poly1305",
- "ed25519-dalek",
- "futures-util",
- "hex",
- "openmls",
- "openmls_basic_credential",
- "openmls_memory_storage",
- "openmls_rust_crypto",
- "openmls_traits",
- "rand_core 0.6.4",
- "rusqlite",
- "rustls",
- "serde",
- "serde_json",
- "sha2",
- "thiserror 2.0.20",
- "tls_codec",
- "tokio",
- "tokio-socks",
- "tokio-tungstenite",
- "zeroize",
-]
-
-[[package]]
 name = "once_cell"
 version = "1.21.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1976,6 +1938,45 @@ dependencies = [
  "getrandom 0.4.3",
  "js-sys",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "valanium-android"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "jni",
+ "valanium-core",
+]
+
+[[package]]
+name = "valanium-core"
+version = "0.1.0"
+source = "git+https://github.com/ifny75/valanium_main?rev=a557f8b8b06e74da17faa4aaadcc3971d7e6939c#a557f8b8b06e74da17faa4aaadcc3971d7e6939c"
+dependencies = [
+ "argon2",
+ "bip39",
+ "chacha20poly1305",
+ "ed25519-dalek",
+ "futures-util",
+ "hex",
+ "openmls",
+ "openmls_basic_credential",
+ "openmls_memory_storage",
+ "openmls_rust_crypto",
+ "openmls_traits",
+ "rand_core 0.6.4",
+ "rusqlite",
+ "rustls",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.20",
+ "tls_codec",
+ "tokio",
+ "tokio-socks",
+ "tokio-tungstenite",
+ "zeroize",
 ]
 
 [[package]]

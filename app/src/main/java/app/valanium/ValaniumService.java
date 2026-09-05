@@ -1,4 +1,4 @@
-package app.obsidian;
+package app.valanium;
 
 import android.app.Notification;
 import android.app.NotificationChannel;
@@ -12,7 +12,7 @@ import android.os.IBinder;
 
 import org.json.JSONObject;
 
-import app.obsidian.core.Core;
+import app.valanium.core.Core;
 
 /**
  * Держит соединение живым. Без foreground-сервиса Doze прибивает WebSocket, и
@@ -21,10 +21,10 @@ import app.obsidian.core.Core;
  * <p>Сервис владеет ядром и потоком опроса. Ядро — синглтон процесса: база
  * открывается один раз, поворот экрана и пересоздание активности его не трогают.
  */
-public final class ObsidianService extends Service {
+public final class ValaniumService extends Service {
 
-    private static final String CHANNEL = "obsidian.connection";
-    private static final String MESSAGE_CHANNEL = "obsidian.messages";
+    private static final String CHANNEL = "valanium.connection";
+    private static final String MESSAGE_CHANNEL = "valanium.messages";
     private static final int NOTIFICATION_ID = 1;
     private static final String CONTENT_PREFIX = "\u2063OBS1:";
     /** Шаг опроса. Поток спит в нативной части, процессор не жжётся. */
@@ -41,7 +41,7 @@ public final class ObsidianService extends Service {
     }
 
     public static void start(Context context) {
-        Intent intent = new Intent(context, ObsidianService.class);
+        Intent intent = new Intent(context, ValaniumService.class);
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             context.startForegroundService(intent);
         } else {
@@ -50,7 +50,7 @@ public final class ObsidianService extends Service {
     }
 
     public static void stop(Context context) {
-        context.stopService(new Intent(context, ObsidianService.class));
+        context.stopService(new Intent(context, ValaniumService.class));
     }
 
     @Override
@@ -68,7 +68,7 @@ public final class ObsidianService extends Service {
         }
 
         running = true;
-        poller = new Thread(this::pollLoop, "obsidian-poll");
+        poller = new Thread(this::pollLoop, "valanium-poll");
         poller.start();
     }
 

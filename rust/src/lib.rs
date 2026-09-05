@@ -1,4 +1,4 @@
-//! JNI-обвязка над obsidian-core.
+//! JNI-обвязка над valanium-core.
 //!
 //! Тонкая по замыслу: четыре функции, всё остальное ходит командами и
 //! событиями в JSON. Тот же словарь, что у Windows-клиента (`command.rs`), —
@@ -8,7 +8,7 @@
 //! `AttachCurrentThread` и `GlobalRef` и легко даёт UB при ошибке; один
 //! фоновый Java-поток, крутящий `nativePoll`, не требует ничего.
 //!
-//! Имена символов обязаны точно соответствовать `app.obsidian.core.Core` —
+//! Имена символов обязаны точно соответствовать `app.valanium.core.Core` —
 //! иначе `UnsatisfiedLinkError` вылезет уже на устройстве. Сверяется скриптом
 //! `check-jni.sh`, который генерирует заголовок через `javac -h`.
 
@@ -18,8 +18,18 @@ use jni::objects::{JClass, JString};
 use jni::sys::{jboolean, jint, jlong, jstring, JNI_FALSE, JNI_TRUE};
 use jni::JNIEnv;
 
-use obsidian_core::ffi::Session;
-use obsidian_core::store::Store;
+use valanium_core::ffi::Session;
+use valanium_core::store::Store;
+
+const RELEASE_PUBLIC_KEY: &str =
+    "a14e480c6926a1379f0d5bb4362f2c7bf214643b016edf6a7b008db0752388ec";
+
+fn verify_release(manifest: &str, signature: &str) -> bool {
+    let (Ok(signature), Ok(public)) = (
+        hex::decode(signature.trim()), hex::decode(RELEASE_PUBLIC_KEY),
+    ) else { return false };
+    valanium_core::keys::verify(&signature, manifest.as_bytes(), &public)
+}
 
 /// `jlong`, в котором Java носит указатель на сессию. 0 — сессии нет.
 type Handle = jlong;
@@ -33,7 +43,7 @@ fn guard<T>(fallback: T, body: impl FnOnce() -> T) -> T {
 /// Открывает базу и поднимает ядро. Возвращает 0, если не вышло, — чаще всего
 /// это неверный пароль.
 #[no_mangle]
-pub extern "system" fn Java_app_obsidian_core_Core_nativeInit(
+pub extern "system" fn Java_app_valanium_core_Core_nativeInit(
     mut env: JNIEnv,
     _class: JClass,
     db_path: JString,
@@ -57,7 +67,7 @@ pub extern "system" fn Java_app_obsidian_core_Core_nativeInit(
 /// Android Keystore. Само открытие SQLite ещё не доказывает правильность
 /// пароля: проверкой служит расшифровка keyring, если он уже существует.
 #[no_mangle]
-pub extern "system" fn Java_app_obsidian_core_Core_nativeVerifyDatabaseKey(
+pub extern "system" fn Java_app_valanium_core_Core_nativeVerifyDatabaseKey(
     mut env: JNIEnv,
     _class: JClass,
     db_path: JString,
@@ -80,9 +90,30 @@ pub extern "system" fn Java_app_obsidian_core_Core_nativeVerifyDatabaseKey(
     })
 }
 
+#[no_mangle]
+pub extern "system" fn Java_app_valanium_core_Core_nativeVerifyRelease(
+    mut env: JNIEnv,
+    _class: JClass,
+    manifest: JString,
+    signature: JString,
+) -> jboolean {
+    guard(JNI_FALSE, move || {
+        let (Ok(manifest), Ok(signature)) = (env.get_string(&manifest), env.get_string(&signature)) else {
+            return JNI_FALSE;
+        };
+        let manifest: String = manifest.into();
+        let signature: String = signature.into();
+        if verify_release(&manifest, &signature) {
+            JNI_TRUE
+        } else {
+            JNI_FALSE
+        }
+    })
+}
+
 /// Команда в формате JSON. 0 — принято, отрицательное — нет.
 #[no_mangle]
-pub extern "system" fn Java_app_obsidian_core_Core_nativeSubmit(
+pub extern "system" fn Java_app_valanium_core_Core_nativeSubmit(
     mut env: JNIEnv,
     _class: JClass,
     handle: Handle,
@@ -111,7 +142,7 @@ pub extern "system" fn Java_app_obsidian_core_Core_nativeSubmit(
 
 /// Одно событие в формате JSON; ждёт до `timeout_ms`. `null` — ничего не пришло.
 #[no_mangle]
-pub extern "system" fn Java_app_obsidian_core_Core_nativePoll(
+pub extern "system" fn Java_app_valanium_core_Core_nativePoll(
     env: JNIEnv,
     _class: JClass,
     handle: Handle,
@@ -138,7 +169,7 @@ pub extern "system" fn Java_app_obsidian_core_Core_nativePoll(
 
 /// Закрывает ядро. После вызова handle невалиден, повторный вызов запрещён.
 #[no_mangle]
-pub extern "system" fn Java_app_obsidian_core_Core_nativeShutdown(
+pub extern "system" fn Java_app_valanium_core_Core_nativeShutdown(
     _env: JNIEnv,
     _class: JClass,
     handle: Handle,
@@ -169,6 +200,18 @@ mod tests {
     #[test]
     fn null_handle_is_not_dereferenced() {
         assert!(session(0).is_none());
+    }
+
+    #[test]
+    fn release_signature_is_bound_to_the_exact_manifest() {
+        // Историческая фикстура: имена в ней намеренно старые. Подпись считается
+        // по точным байтам манифеста, поэтому переименовать их внутри строки
+        // нельзя — это сломало бы ровно то свойство, которое тест и проверяет.
+        // Новый манифест появится при первом релизе под новым именем.
+        let manifest = r#"{"v":1,"channel":"public-beta","publishedAt":"2026-08-30T12:46:34.734Z","windows":{"version":"0.11.0","url":"https://getobsidian.xyz/downloads/Obsidian-0.11.0.exe","sha256":"3b888edd896dc242fc9f6e0d521761fef1e63a12fda16757c1b809d1528cf4b0","bytes":16199680},"android":{"version":"0.6.2","url":"https://getobsidian.xyz/downloads/Obsidian-0.6.2.apk","sha256":"02e8ecf8375b4c551e93d04ad958a0935807499d7b8738e9b2765608f34a73f7","bytes":5218987}}"#;
+        let signature = "b0a3bb4c87e177b3aeaf9ea7d92b3d2a8635c43539cb4d35b2888e7968fab0402b55a4f75f551ef4a13dab95c1870bac77a5abccf75e804862ce0f7a4ab4ff00";
+        assert!(verify_release(manifest, signature));
+        assert!(!verify_release(&(manifest.to_owned() + " "), signature));
     }
 
     #[test]

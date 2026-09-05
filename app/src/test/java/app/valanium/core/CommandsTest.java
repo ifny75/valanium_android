@@ -1,4 +1,4 @@
-package app.obsidian.core;
+package app.valanium.core;
 
 import static org.junit.Assert.assertEquals;
 
@@ -46,8 +46,8 @@ public class CommandsTest {
     @Test
     public void connectCarriesUrl() {
         assertEquals(
-                "{\"type\":\"connect\",\"url\":\"wss://obsidian.example/ws\"}",
-                Commands.connect("wss://obsidian.example/ws"));
+                "{\"type\":\"connect\",\"url\":\"wss://valanium.example/ws\"}",
+                Commands.connect("wss://valanium.example/ws"));
     }
 
     @Test

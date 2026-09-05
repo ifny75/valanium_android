@@ -1,4 +1,4 @@
-package app.obsidian;
+package app.valanium;
 
 import android.app.Activity;
 import android.app.AlertDialog;
@@ -20,6 +20,7 @@ import android.media.MediaPlayer;
 import android.media.MediaRecorder;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.SystemClock;
 import android.os.Build;
 import android.os.Bundle;
 import android.util.Base64;
@@ -63,22 +64,29 @@ import java.text.SimpleDateFormat;
 import java.util.Date;
 import java.util.Calendar;
 
-import app.obsidian.core.Commands;
+import app.valanium.core.Commands;
 
-/** Нативный мобильный интерфейс поверх общего Rust-ядра Obsidian. */
+/** Нативный мобильный интерфейс поверх общего Rust-ядра Valanium. */
 public final class MainActivity extends Activity implements Events.Listener {
+    private static long backgroundedAt = -1L;
+    private boolean foregroundAuthorized;
+    private boolean warmCoreUnlock;
 
-    private static final String SERVER_BASIC_URL = "wss://getobsidian.xyz/ws";
-    private static final String SERVER_MULTIHOP_URL = "wss://getobsidian.xyz/multihop/ws";
+    private static final String SERVER_BASIC_URL = "wss://valanium.com/ws";
+    private static final String SERVER_MULTIHOP_URL = "wss://valanium.com/multihop/ws";
     /*
       Адреса onion-входа здесь нет намеренно: их несколько, они меняются вместе
       с узлами, и сервер называет их сам в HELLO. Приложение просит режим, а
       какой вход открыт сегодня — решает ядро (routes_for в client.rs).
     */
-    private static final String SERVER_ONION_URL = "obsidian://onion";
-    private static final String SERVER_AUTO_URL = "obsidian://auto";
+    private static final String SERVER_ONION_URL = "valanium://onion";
+    private static final String SERVER_AUTO_URL = "valanium://auto";
     private static final String TRANSPORT_KEY = "transport";
-    private static final String RELEASES_URL = "https://getobsidian.xyz/v1/releases/latest";
+    /** Какой узел выбран вторым плечом. Пусто — выбирает сеть. */
+    private static final String HOP_KEY = "multihop_node";
+    /** Имена те же, что на странице состояния сети: человек выбирает из них же. */
+    private static final String[] HOP_NODES = { "alpha", "beta", "gamma" };
+    private static final String RELEASES_URL = "https://valanium.com/v1/releases/latest";
     /** Сколько сообщений поднимать за раз. Остальное — по прокрутке вверх. */
     private static final int HISTORY_PAGE = 40;
 
@@ -447,6 +455,14 @@ public final class MainActivity extends Activity implements Events.Listener {
         findViewById(R.id.attach_photo).setOnClickListener(v -> choosePhoto());
         findViewById(R.id.verify_peer).setOnClickListener(v -> { if (currentPeer != null) submit(Commands.verify(currentPeer)); });
         configureRecovery();
+        findViewById(R.id.revoke_other_devices).setOnClickListener(v ->
+                new AlertDialog.Builder(this)
+                        .setTitle(R.string.revoke_devices_title)
+                        .setMessage(R.string.revoke_devices_confirm)
+                        .setPositiveButton(R.string.revoke_devices_action,
+                                (dialog, which) -> submit(Commands.revokeOtherDevices()))
+                        .setNegativeButton(R.string.cancel, null)
+                        .show());
         configureVoice();
         configurePreferences();
         configureTransport();
@@ -456,12 +472,7 @@ public final class MainActivity extends Activity implements Events.Listener {
         show(screenBoot);
         requestNotificationPermission();
         try {
-            if (ObsidianService.core().isOpen()) {
-                getWindow().getDecorView().post(() -> {
-                    startEventDelivery();
-                    submit(Commands.status());
-                });
-            } else {
+            if (!ValaniumService.core().isOpen()) {
                 autoOpenDatabase();
             }
         } catch (Throwable error) {
@@ -473,11 +484,18 @@ public final class MainActivity extends Activity implements Events.Listener {
     @Override
     protected void onStart() {
         super.onStart();
-        Events.subscribe(this);
         try {
-            if (ObsidianService.core().isOpen() && !canUseForegroundService()) {
-                startLocalPolling();
+            if (!ValaniumService.core().isOpen()) return;
+            LocalSecretStore secrets = new LocalSecretStore(this);
+            long elapsed = backgroundedAt < 0 ? Long.MAX_VALUE
+                    : Math.max(0L, SystemClock.elapsedRealtime() - backgroundedAt);
+            if (secrets.locked() && elapsed >= secrets.lockSeconds() * 1000L) {
+                foregroundAuthorized = false;
+                warmCoreUnlock = true;
+                askForUnlock();
+                return;
             }
+            authorizeForeground();
         } catch (Throwable error) {
             showStartupError(error);
         }
@@ -485,6 +503,8 @@ public final class MainActivity extends Activity implements Events.Listener {
 
     @Override
     protected void onStop() {
+        backgroundedAt = SystemClock.elapsedRealtime();
+        foregroundAuthorized = false;
         stopRecording(false);
         stopVoicePlayback();
         stopLocalPolling();
@@ -506,10 +526,10 @@ public final class MainActivity extends Activity implements Events.Listener {
         }
         if (requestCode != NOTIFICATION_PERMISSION_REQUEST) return;
         if (grantResults.length > 0 && grantResults[0] == PackageManager.PERMISSION_GRANTED
-                && ObsidianService.core().isOpen()) {
+                && ValaniumService.core().isOpen()) {
             stopLocalPolling();
             startEventDelivery();
-        } else if (ObsidianService.core().isOpen()) {
+        } else if (ValaniumService.core().isOpen()) {
             startLocalPolling();
             showBanner(getString(R.string.notifications_disabled_title),
                     getString(R.string.notifications_disabled_hint), this::openNotificationSettings);
@@ -704,7 +724,23 @@ public final class MainActivity extends Activity implements Events.Listener {
         SharedPreferences preferences = appearancePreferences == null
                 ? getSharedPreferences("appearance", MODE_PRIVATE) : appearancePreferences;
         String mode = preferences.getString(TRANSPORT_KEY, "auto");
-        if ("multihop".equals(mode)) return SERVER_MULTIHOP_URL;
+        if ("multihop".equals(mode)) {
+            /*
+              Первый узел выбирает Cloudflare, и повлиять на это нечем: у всех
+              relay один общий адрес. А кому он передаст дальше — выбирает
+              человек.
+
+              Если Cloudflare привёл на тот самый узел, что выбран вторым, узел
+              отвечает 421: двух разных плеч из одного не сделать. Ядро сочтёт
+              это отказом соединения и попробует снова — следующая попытка
+              почти наверняка придёт на другой вход.
+            */
+            String hop = preferences.getString(HOP_KEY, "");
+            for (String node : HOP_NODES) {
+                if (node.equals(hop)) return "wss://valanium.com/multihop/" + node + "/ws";
+            }
+            return SERVER_MULTIHOP_URL;
+        }
         if ("onion".equals(mode)) return SERVER_ONION_URL;
         if ("basic".equals(mode)) return SERVER_BASIC_URL;
         return SERVER_AUTO_URL;
@@ -716,12 +752,59 @@ public final class MainActivity extends Activity implements Events.Listener {
         routes.setOnModeChangedListener(mode -> {
             if (mode.equals(appearancePreferences.getString(TRANSPORT_KEY, "auto"))) return;
             appearancePreferences.edit().putString(TRANSPORT_KEY, mode).apply();
+            showHopCard();
             if (!myDeviceHex.isEmpty()) {
                 submit(Commands.disconnect());
                 setStatus(getString(R.string.transport_switching));
                 ui.postDelayed(() -> submit(Commands.connect(serverUrl())), 250);
             }
         });
+        configureHopPicker();
+    }
+
+    private void configureHopPicker() {
+        int[] ids = { R.id.hop_auto, R.id.hop_alpha, R.id.hop_beta, R.id.hop_gamma };
+        String[] values = { "", HOP_NODES[0], HOP_NODES[1], HOP_NODES[2] };
+        for (int i = 0; i < ids.length; i++) {
+            final String value = values[i];
+            findViewById(ids[i]).setOnClickListener(v -> chooseHop(value));
+        }
+        showHopCard();
+    }
+
+    /**
+     * Выбор второго узла виден только в Multi-hop.
+     *
+     * В остальных режимах второго узла нет вовсе, и показывать переключатель
+     * значило бы обещать настройку, которая ни на что не влияет.
+     */
+    private void showHopCard() {
+        View card = findViewById(R.id.hop_card);
+        if (card == null) return;
+        boolean multihop = "multihop".equals(appearancePreferences.getString(TRANSPORT_KEY, "auto"));
+        card.setVisibility(multihop ? View.VISIBLE : View.GONE);
+        if (multihop) markChosenHop();
+    }
+
+    private void markChosenHop() {
+        String hop = appearancePreferences.getString(HOP_KEY, "");
+        int[] ids = { R.id.hop_auto, R.id.hop_alpha, R.id.hop_beta, R.id.hop_gamma };
+        String[] values = { "", HOP_NODES[0], HOP_NODES[1], HOP_NODES[2] };
+        for (int i = 0; i < ids.length; i++) {
+            findViewById(ids[i]).setAlpha(values[i].equals(hop) ? 1f : 0.55f);
+        }
+    }
+
+    private void chooseHop(String node) {
+        if (node.equals(appearancePreferences.getString(HOP_KEY, ""))) return;
+        appearancePreferences.edit().putString(HOP_KEY, node).apply();
+        markChosenHop();
+        toast(node.isEmpty() ? getString(R.string.hop_switched_auto)
+                : getString(R.string.hop_switched, node));
+        if (myDeviceHex.isEmpty()) return;
+        submit(Commands.disconnect());
+        setStatus(getString(R.string.transport_switching));
+        ui.postDelayed(() -> submit(Commands.connect(serverUrl())), 250);
     }
 
     // --- тема ------------------------------------------------------------------
@@ -914,7 +997,7 @@ public final class MainActivity extends Activity implements Events.Listener {
             frame.setColor(themeBackground());
             frame.setCornerRadius(dp(9));
             frame.setStroke(dp(key.equals(current) ? 2 : 1),
-                    key.equals(current) ? accentColor() : getColor(R.color.obsidian_line));
+                    key.equals(current) ? accentColor() : getColor(R.color.valanium_line));
             // Образцу нужен свой масштаб: пятно радиусом в экран внутри клетки
             // в палец шириной выглядит просто заливкой.
             Drawable pattern = wallpaperPattern(key, dp(64));
@@ -927,7 +1010,7 @@ public final class MainActivity extends Activity implements Events.Listener {
             label.setText(getString(getResources().getIdentifier(
                     spec[1], "string", getPackageName())));
             label.setTextColor(getColor(key.equals(current)
-                    ? R.color.obsidian_white : R.color.obsidian_muted));
+                    ? R.color.valanium_white : R.color.valanium_muted));
             label.setTextSize(9);
             label.setGravity(Gravity.CENTER);
             label.setPadding(0, dp(4), 0, 0);
@@ -1231,6 +1314,12 @@ public final class MainActivity extends Activity implements Events.Listener {
             }
             findViewById(R.id.boot_unlock).setVisibility(View.GONE);
             ((TextView) findViewById(R.id.boot_status)).setText(R.string.boot_status);
+            if (warmCoreUnlock && ValaniumService.core().isOpen()) {
+                warmCoreUnlock = false;
+                authorizeForeground();
+                return;
+            }
+            warmCoreUnlock = false;
             autoOpenDatabase();
             return;
         }
@@ -1246,7 +1335,7 @@ public final class MainActivity extends Activity implements Events.Listener {
             } catch (Exception error) {
                 runOnUiThread(() -> toast("Не удалось прочитать изображение"));
             }
-        }, avatar ? "obsidian-avatar" : "obsidian-photo").start();
+        }, avatar ? "valanium-avatar" : "valanium-photo").start();
     }
 
     /**
@@ -1286,7 +1375,7 @@ public final class MainActivity extends Activity implements Events.Listener {
                     secret = LocalSecretStore.randomSecret();
                     secrets.save(secret);
                 }
-                boolean opened = ObsidianService.core().open(db.getAbsolutePath(), secret);
+                boolean opened = ValaniumService.core().open(db.getAbsolutePath(), secret);
                 runOnUiThread(() -> finishOpen(opened));
             } catch (android.security.keystore.UserNotAuthenticatedException locked) {
                 // Замок включён, и система не отдала ключ: подтверждение
@@ -1296,7 +1385,7 @@ public final class MainActivity extends Activity implements Events.Listener {
             } catch (Throwable error) {
                 runOnUiThread(() -> showStartupError(error));
             }
-        }, "obsidian-auto-open").start();
+        }, "valanium-auto-open").start();
     }
 
     // --- замок приложения ------------------------------------------------------
@@ -1462,7 +1551,7 @@ public final class MainActivity extends Activity implements Events.Listener {
 
         new Thread(() -> {
             File db = databaseFile();
-            boolean verified = ObsidianService.core()
+            boolean verified = ValaniumService.core()
                     .verifyDatabaseKey(db.getAbsolutePath(), secret);
             if (!verified) {
                 runOnUiThread(() -> {
@@ -1473,12 +1562,12 @@ public final class MainActivity extends Activity implements Events.Listener {
             }
             try {
                 new LocalSecretStore(this).save(secret);
-                boolean opened = ObsidianService.core().open(db.getAbsolutePath(), secret);
+                boolean opened = ValaniumService.core().open(db.getAbsolutePath(), secret);
                 runOnUiThread(() -> finishOpen(opened));
             } catch (Throwable error) {
                 runOnUiThread(() -> showStartupError(error));
             }
-        }, "obsidian-migrate").start();
+        }, "valanium-migrate").start();
     }
 
     private void confirmResetLegacyDatabase() {
@@ -1498,7 +1587,7 @@ public final class MainActivity extends Activity implements Events.Listener {
                 archiveLegacyDatabase();
                 String secret = LocalSecretStore.randomSecret();
                 new LocalSecretStore(this).save(secret);
-                boolean opened = ObsidianService.core()
+                boolean opened = ValaniumService.core()
                         .open(databaseFile().getAbsolutePath(), secret);
                 runOnUiThread(() -> finishOpen(opened));
             } catch (Throwable error) {
@@ -1507,7 +1596,7 @@ public final class MainActivity extends Activity implements Events.Listener {
                     showFatal(getString(R.string.reset_database_error));
                 });
             }
-        }, "obsidian-reset").start();
+        }, "valanium-reset").start();
     }
 
     private void archiveLegacyDatabase() throws IOException {
@@ -1535,6 +1624,13 @@ public final class MainActivity extends Activity implements Events.Listener {
             return;
         }
         migrationPassword.setText("");
+        authorizeForeground();
+    }
+
+    private void authorizeForeground() {
+        foregroundAuthorized = true;
+        backgroundedAt = -1L;
+        Events.subscribe(this);
         startEventDelivery();
         submit(Commands.status());
     }
@@ -1566,7 +1662,7 @@ public final class MainActivity extends Activity implements Events.Listener {
         }
         stopLocalPolling();
         try {
-            ObsidianService.start(this);
+            ValaniumService.start(this);
         } catch (RuntimeException error) {
             startLocalPolling();
             toast(getString(R.string.background_limited));
@@ -1574,14 +1670,14 @@ public final class MainActivity extends Activity implements Events.Listener {
     }
 
     private synchronized void startLocalPolling() {
-        if (localPolling || !ObsidianService.core().isOpen()) return;
+        if (localPolling || !ValaniumService.core().isOpen()) return;
         localPolling = true;
         localPoller = new Thread(() -> {
             while (localPolling) {
-                String event = ObsidianService.core().poll(500);
+                String event = ValaniumService.core().poll(500);
                 if (event != null) Events.publish(event);
             }
-        }, "obsidian-activity-poll");
+        }, "valanium-activity-poll");
         localPoller.start();
     }
 
@@ -1602,7 +1698,7 @@ public final class MainActivity extends Activity implements Events.Listener {
     }
 
     private File databaseFile() {
-        return new File(getFilesDir(), "obsidian.db");
+        return new File(getFilesDir(), "valanium.db");
     }
 
     // --- действия --------------------------------------------------------------
@@ -1626,15 +1722,30 @@ public final class MainActivity extends Activity implements Events.Listener {
                     byte[] chunk = new byte[4096];
                     int count;
                     while ((count = stream.read(chunk)) != -1) bytes.write(chunk, 0, count);
-                    JSONObject release = new JSONObject(bytes.toString("UTF-8")).getJSONObject("android");
+                    JSONObject outer = new JSONObject(bytes.toString("UTF-8"));
+                    String manifestText = outer.getString("manifest");
+                    String signature = outer.getString("signature");
+                    if (!ValaniumService.core().verifyRelease(manifestText, signature)) return;
+                    JSONObject manifest = new JSONObject(manifestText);
+                    if (manifest.getInt("v") != 1) return;
+                    JSONObject release = manifest.getJSONObject("android");
                     String latest = release.getString("version");
                     String url = release.getString("url");
+                    String sha256 = release.getString("sha256");
+                    long expectedBytes = release.getLong("bytes");
+                    Uri download = Uri.parse(url);
+                    if (!"https".equals(download.getScheme())
+                            || !"valanium.com".equals(download.getHost())
+                            || download.getPath() == null
+                            || !download.getPath().startsWith("/downloads/")
+                            || !sha256.matches("^[0-9a-f]{64}$")
+                            || expectedBytes <= 0) return;
                     if (compareVersions(latest, appVersion()) > 0) {
                         runOnUiThread(() -> new AlertDialog.Builder(this)
                                 .setTitle("Доступно обновление " + latest)
                                 .setMessage("Скачать новую Public Beta? Установка начнётся только после подтверждения Android.")
                                 .setPositiveButton("Скачать", (dialog, which) ->
-                                        startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(url))))
+                                        startActivity(new Intent(Intent.ACTION_VIEW, download)))
                                 .setNegativeButton("Позже", null)
                                 .show());
                     }
@@ -1644,7 +1755,7 @@ public final class MainActivity extends Activity implements Events.Listener {
             } finally {
                 if (connection != null) connection.disconnect();
             }
-        }, "obsidian-update-check").start();
+        }, "valanium-update-check").start();
     }
 
     /**
@@ -1877,7 +1988,8 @@ public final class MainActivity extends Activity implements Events.Listener {
     }
 
     private void submit(String command) {
-        if (!ObsidianService.core().submit(command)) {
+        if (!foregroundAuthorized) return;
+        if (!ValaniumService.core().submit(command)) {
             toast(getString(R.string.core_busy));
         }
     }
@@ -1886,7 +1998,11 @@ public final class MainActivity extends Activity implements Events.Listener {
 
     @Override
     public void onEvent(JSONObject event) {
+        if (!foregroundAuthorized) return;
         switch (event.optString("type")) {
+            case "devices_revoked":
+                toast(getString(R.string.revoke_devices_done, event.optInt("count")));
+                break;
             case "status":
                 onStatus(event);
                 break;
@@ -2250,9 +2366,9 @@ public final class MainActivity extends Activity implements Events.Listener {
                     || (tab[0] == R.id.nav_settings && screen == screenSettings)
                     || (tab[0] == R.id.nav_profile && screen == screenProfile);
             ((ImageView) findViewById(tab[1])).setImageTintList(
-                    ColorStateList.valueOf(active ? accent : getColor(R.color.obsidian_muted)));
+                    ColorStateList.valueOf(active ? accent : getColor(R.color.valanium_muted)));
             ((TextView) findViewById(tab[2])).setTextColor(
-                    active ? accent : getColor(R.color.obsidian_muted));
+                    active ? accent : getColor(R.color.valanium_muted));
         }
     }
 
@@ -2362,7 +2478,7 @@ public final class MainActivity extends Activity implements Events.Listener {
         if (myDeviceHex.isEmpty()) return;
         android.content.ClipboardManager clipboard =
                 (android.content.ClipboardManager) getSystemService(CLIPBOARD_SERVICE);
-        clipboard.setPrimaryClip(android.content.ClipData.newPlainText("Obsidian device", myDeviceHex));
+        clipboard.setPrimaryClip(android.content.ClipData.newPlainText("Valanium device", myDeviceHex));
         toast(getString(R.string.device_copied));
     }
 
@@ -2385,7 +2501,7 @@ public final class MainActivity extends Activity implements Events.Listener {
     private TextView listNotice(String text) {
         TextView notice = new TextView(this);
         notice.setText(text);
-        notice.setTextColor(getColor(R.color.obsidian_muted));
+        notice.setTextColor(getColor(R.color.valanium_muted));
         notice.setTextSize(14);
         notice.setGravity(Gravity.CENTER);
         notice.setPadding(0, dp(80), 0, dp(40));
@@ -2399,7 +2515,7 @@ public final class MainActivity extends Activity implements Events.Listener {
         }
         android.content.ClipboardManager clipboard =
                 (android.content.ClipboardManager) getSystemService(CLIPBOARD_SERVICE);
-        clipboard.setPrimaryClip(android.content.ClipData.newPlainText("Obsidian chat code", ownChatCode));
+        clipboard.setPrimaryClip(android.content.ClipData.newPlainText("Valanium chat code", ownChatCode));
         toast("Код для чата скопирован");
     }
 
@@ -2414,9 +2530,9 @@ public final class MainActivity extends Activity implements Events.Listener {
         statusText = text;
         View dot = findViewById(R.id.status_dot);
         int color = getString(R.string.status_online).equals(text)
-                ? getColor(R.color.obsidian_green)
+                ? getColor(R.color.valanium_green)
                 : getString(R.string.status_reconnecting).equals(text)
-                        ? getColor(R.color.obsidian_danger)
+                        ? getColor(R.color.valanium_danger)
                         : Color.rgb(224, 178, 92);
         dot.setBackgroundTintList(ColorStateList.valueOf(color));
         status.setContentDescription(text);
@@ -2443,7 +2559,7 @@ public final class MainActivity extends Activity implements Events.Listener {
         if (conversations.isEmpty()) {
             TextView empty = new TextView(this);
             empty.setText("Пока нет контактов\nДобавьте человека по короткому OBS-коду");
-            empty.setTextColor(getColor(R.color.obsidian_muted));
+            empty.setTextColor(getColor(R.color.valanium_muted));
             empty.setTextSize(14);
             empty.setGravity(Gravity.CENTER);
             empty.setPadding(0, dp(80), 0, dp(40));
@@ -2483,7 +2599,7 @@ public final class MainActivity extends Activity implements Events.Listener {
             TextView subtitle = new TextView(this);
             ConversationPreview preview = previews.get(peer);
             subtitle.setText(previewText(preview));
-            subtitle.setTextColor(getColor(R.color.obsidian_muted));
+            subtitle.setTextColor(getColor(R.color.valanium_muted));
             subtitle.setTextSize(12);
             subtitle.setMaxLines(1);
             subtitle.setEllipsize(TextUtils.TruncateAt.END);
@@ -2497,7 +2613,7 @@ public final class MainActivity extends Activity implements Events.Listener {
             meta.setGravity(Gravity.END);
             TextView time = new TextView(this);
             time.setText(previewTime(preview));
-            time.setTextColor(getColor(R.color.obsidian_dim));
+            time.setTextColor(getColor(R.color.valanium_dim));
             time.setTextSize(10);
             time.setGravity(Gravity.END);
             meta.addView(time);
@@ -3183,7 +3299,7 @@ public final class MainActivity extends Activity implements Events.Listener {
             android.content.ClipboardManager clipboard =
                     (android.content.ClipboardManager) getSystemService(CLIPBOARD_SERVICE);
             clipboard.setPrimaryClip(
-                    android.content.ClipData.newPlainText("Obsidian recovery", recoveryCodeValue));
+                    android.content.ClipData.newPlainText("Valanium recovery", recoveryCodeValue));
             toast(getString(R.string.recovery_code_copied));
         });
         recoveryPasswordSave.setOnClickListener(v -> saveRecoveryPassword());
@@ -3209,7 +3325,7 @@ public final class MainActivity extends Activity implements Events.Listener {
                     on ? accentColor() : Color.argb(255, 26, 26, 26)));
             button.setTextColor(on
                     ? (Color.luminance(accentColor()) > .55 ? Color.BLACK : Color.WHITE)
-                    : getColor(R.color.obsidian_muted));
+                    : getColor(R.color.valanium_muted));
         }
     }
 
@@ -3274,7 +3390,7 @@ public final class MainActivity extends Activity implements Events.Listener {
 
     private void setRecoveryStatus(String message, boolean bad) {
         recoveryStatus.setText(message);
-        recoveryStatus.setTextColor(bad ? getColor(R.color.obsidian_danger) : getColor(R.color.obsidian_muted));
+        recoveryStatus.setTextColor(bad ? getColor(R.color.valanium_danger) : getColor(R.color.valanium_muted));
     }
 
     /**
@@ -3411,7 +3527,7 @@ public final class MainActivity extends Activity implements Events.Listener {
             } finally {
                 file.delete();
             }
-        }, "obsidian-voice").start();
+        }, "valanium-voice").start();
     }
 
     private static String encodeVoice(String id, String data, int seconds) {
@@ -3531,7 +3647,7 @@ public final class MainActivity extends Activity implements Events.Listener {
         boolean warning = text.toLowerCase(Locale.ROOT).matches(
                 ".*(ошиб|не удалось|недоступ|связ|подключ|сервер|огранич).*" );
         icon.setText(warning ? "!" : "✓");
-        icon.setTextColor(warning ? getColor(R.color.obsidian_danger) : accentColor());
+        icon.setTextColor(warning ? getColor(R.color.valanium_danger) : accentColor());
         icon.setTextSize(14);
         icon.setGravity(Gravity.CENTER);
         GradientDrawable iconGlass = new GradientDrawable();
@@ -3556,7 +3672,7 @@ public final class MainActivity extends Activity implements Events.Listener {
         }
         TextView message = new TextView(this);
         message.setText(text);
-        message.setTextColor(title == null ? Color.WHITE : getColor(R.color.obsidian_muted));
+        message.setTextColor(title == null ? Color.WHITE : getColor(R.color.valanium_muted));
         message.setTextSize(title == null ? 12 : 11);
         message.setMaxLines(1);
         message.setEllipsize(TextUtils.TruncateAt.END);
@@ -3651,7 +3767,7 @@ public final class MainActivity extends Activity implements Events.Listener {
     private void copyToClipboard(String value, String confirmation) {
         android.content.ClipboardManager clipboard =
                 (android.content.ClipboardManager) getSystemService(CLIPBOARD_SERVICE);
-        clipboard.setPrimaryClip(android.content.ClipData.newPlainText("Obsidian", value));
+        clipboard.setPrimaryClip(android.content.ClipData.newPlainText("Valanium", value));
         toast(confirmation);
     }
 
@@ -3662,13 +3778,13 @@ public final class MainActivity extends Activity implements Events.Listener {
 
         TextView title = new TextView(this);
         title.setText(R.string.attachment_hidden);
-        title.setTextColor(getColor(R.color.obsidian_white));
+        title.setTextColor(getColor(R.color.valanium_white));
         title.setTextSize(12);
         wrap.addView(title);
 
         TextView why = new TextView(this);
         why.setText(R.string.attachment_hidden_why);
-        why.setTextColor(getColor(R.color.obsidian_muted));
+        why.setTextColor(getColor(R.color.valanium_muted));
         why.setTextSize(10);
         LinearLayout.LayoutParams whyParams = new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
@@ -3676,7 +3792,7 @@ public final class MainActivity extends Activity implements Events.Listener {
         why.setLayoutParams(whyParams);
         wrap.addView(why);
 
-        Button show = new Button(this, null, 0, R.style.Obsidian_Button_Dark_Small);
+        Button show = new Button(this, null, 0, R.style.Valanium_Button_Dark_Small);
         show.setText(R.string.show);
         show.setTextSize(10);
         LinearLayout.LayoutParams showParams = new LinearLayout.LayoutParams(
@@ -3776,7 +3892,7 @@ public final class MainActivity extends Activity implements Events.Listener {
             button.setTextColor(Color.luminance(accent) > .55 ? Color.BLACK : Color.WHITE);
         } else {
             button.setBackgroundTintList(null);
-            button.setTextColor(getColor(R.color.obsidian_muted));
+            button.setTextColor(getColor(R.color.valanium_muted));
         }
     }
 
@@ -3804,7 +3920,7 @@ public final class MainActivity extends Activity implements Events.Listener {
                         new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(1));
                 lineParams.leftMargin = dp(50);
                 line.setLayoutParams(lineParams);
-                line.setBackgroundColor(getColor(R.color.obsidian_line));
+                line.setBackgroundColor(getColor(R.color.valanium_line));
                 host.addView(line);
             }
 
@@ -3824,7 +3940,7 @@ public final class MainActivity extends Activity implements Events.Listener {
 
             TextView title = new TextView(this);
             title.setText(row[1]);
-            title.setTextColor(getColor(R.color.obsidian_white));
+            title.setTextColor(getColor(R.color.valanium_white));
             title.setTextSize(14);
             title.setLayoutParams(new LinearLayout.LayoutParams(
                     0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
@@ -3896,14 +4012,14 @@ public final class MainActivity extends Activity implements Events.Listener {
 
         TextView label = new TextView(this);
         label.setText(spec[1]);
-        label.setTextColor(getColor(R.color.obsidian_white));
+        label.setTextColor(getColor(R.color.valanium_white));
         label.setTextSize(13);
         row.addView(label);
 
         if (!spec[2].isEmpty()) {
             TextView hint = new TextView(this);
             hint.setText(spec[2]);
-            hint.setTextColor(getColor(R.color.obsidian_muted));
+            hint.setTextColor(getColor(R.color.valanium_muted));
             hint.setTextSize(10);
             LinearLayout.LayoutParams hintParams = new LinearLayout.LayoutParams(
                     LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
@@ -3925,7 +4041,7 @@ public final class MainActivity extends Activity implements Events.Listener {
 
         String current = rule.optString("scope");
         for (String scope : scopes) {
-            Button choice = new Button(this, null, 0, R.style.Obsidian_Segment);
+            Button choice = new Button(this, null, 0, R.style.Valanium_Segment);
             choice.setText(scopeLabel(scope));
             markActive(choice, scope.equals(current), R.drawable.chip_active, R.drawable.chip_idle);
             LinearLayout.LayoutParams params =
@@ -3947,13 +4063,13 @@ public final class MainActivity extends Activity implements Events.Listener {
 
         TextView counts = new TextView(this);
         counts.setText(exceptionSummary(rule));
-        counts.setTextColor(getColor(R.color.obsidian_dim));
+        counts.setTextColor(getColor(R.color.valanium_dim));
         counts.setTextSize(9);
         counts.setLayoutParams(new LinearLayout.LayoutParams(0,
                 LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
         foot.addView(counts);
 
-        Button exceptions = new Button(this, null, 0, R.style.Obsidian_Segment);
+        Button exceptions = new Button(this, null, 0, R.style.Valanium_Segment);
         exceptions.setText(R.string.exceptions);
         exceptions.setOnClickListener(v -> showExceptions(key, spec[1]));
         foot.addView(exceptions);
@@ -4241,7 +4357,7 @@ public final class MainActivity extends Activity implements Events.Listener {
     private void renderOwnProfile() {
         TextView name = findViewById(R.id.profile_name);
         name.setText(username == null ? getString(R.string.username_free) : "@" + username);
-        name.setTextColor(getColor(R.color.obsidian_white));
+        name.setTextColor(getColor(R.color.valanium_white));
         // Свой аватар красится тем же цветом, что увидят собеседники.
         Profile own = profiles.get(myDeviceHex);
         if (own != null) {
@@ -4357,7 +4473,7 @@ public final class MainActivity extends Activity implements Events.Listener {
         // Ключи приходят от сервера как есть: отчёт панели ядро не переписывает.
         title.setText(optText(user, "chatCode").isEmpty()
                 ? shortHex(identity) : user.optString("chatCode"));
-        title.setTextColor(getColor(blocked ? R.color.obsidian_danger : R.color.obsidian_white));
+        title.setTextColor(getColor(blocked ? R.color.valanium_danger : R.color.valanium_white));
         title.setTextSize(13);
 
         TextView details = new TextView(this);
@@ -4367,13 +4483,13 @@ public final class MainActivity extends Activity implements Events.Listener {
                         java.text.DateFormat.SHORT, java.text.DateFormat.SHORT)
                         .format(new java.util.Date(seen))
                         : getString(R.string.admin_never_seen)));
-        details.setTextColor(getColor(R.color.obsidian_muted));
+        details.setTextColor(getColor(R.color.valanium_muted));
         details.setTextSize(10);
         copy.addView(title);
         copy.addView(details);
         row.addView(copy);
 
-        Button action = new Button(this, null, 0, R.style.Obsidian_Button_Dark_Small);
+        Button action = new Button(this, null, 0, R.style.Valanium_Button_Dark_Small);
         action.setText(blocked ? R.string.admin_open_entry : R.string.admin_close_entry);
         action.setOnClickListener(v -> new AlertDialog.Builder(this)
                 .setTitle(blocked ? R.string.admin_open_entry : R.string.admin_close_entry)
@@ -4407,13 +4523,13 @@ public final class MainActivity extends Activity implements Events.Listener {
         row.setPadding(0, dp(6), 0, dp(6));
         TextView left = new TextView(this);
         left.setText(label);
-        left.setTextColor(getColor(R.color.obsidian_muted));
+        left.setTextColor(getColor(R.color.valanium_muted));
         left.setTextSize(12);
         left.setLayoutParams(new LinearLayout.LayoutParams(0,
                 LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
         TextView right = new TextView(this);
         right.setText(value);
-        right.setTextColor(getColor(R.color.obsidian_white));
+        right.setTextColor(getColor(R.color.valanium_white));
         right.setTextSize(12);
         row.addView(left);
         row.addView(right);
@@ -4490,8 +4606,8 @@ public final class MainActivity extends Activity implements Events.Listener {
         // SQLite в режиме WAL держит свежие записи в отдельном файле: без него
         // «база» показывала бы четыре килобайта при полной переписке.
         long database = databaseFile().length()
-                + new File(getFilesDir(), "obsidian.db-wal").length()
-                + new File(getFilesDir(), "obsidian.db-shm").length();
+                + new File(getFilesDir(), "valanium.db-wal").length()
+                + new File(getFilesDir(), "valanium.db-shm").length();
         long cache = directorySize(getCacheDir());
         view.setText(getString(R.string.data_sizes, formatBytes(database), formatBytes(cache),
                 conversations.size()));
@@ -4585,7 +4701,7 @@ public final class MainActivity extends Activity implements Events.Listener {
         TextView subtitle = new TextView(this);
         subtitle.setText(conversations.containsKey(device)
                 ? getString(R.string.search_known) : getString(R.string.search_found));
-        subtitle.setTextColor(getColor(R.color.obsidian_muted));
+        subtitle.setTextColor(getColor(R.color.valanium_muted));
         subtitle.setTextSize(11);
         copy.addView(title);
         copy.addView(subtitle);
@@ -4718,7 +4834,7 @@ public final class MainActivity extends Activity implements Events.Listener {
         TextView mark = new TextView(this);
         mark.setText("◈");
         mark.setGravity(Gravity.CENTER);
-        mark.setTextColor(getColor(R.color.obsidian_white));
+        mark.setTextColor(getColor(R.color.valanium_white));
         mark.setBackground(avatarPlaceholder());
         mark.setLayoutParams(new LinearLayout.LayoutParams(dp(44), dp(44)));
 
@@ -4735,7 +4851,7 @@ public final class MainActivity extends Activity implements Events.Listener {
         TextView handle = new TextView(this);
         handle.setText("@" + channel.optString("handle")
                 + (channel.optBoolean("owner") ? " · " + getString(R.string.channel_yours) : ""));
-        handle.setTextColor(getColor(R.color.obsidian_muted));
+        handle.setTextColor(getColor(R.color.valanium_muted));
         handle.setTextSize(11);
         copy.addView(title);
         copy.addView(handle);
@@ -4800,14 +4916,14 @@ public final class MainActivity extends Activity implements Events.Listener {
 
         TextView body = new TextView(this);
         body.setText(post.optString("body"));
-        body.setTextColor(getColor(R.color.obsidian_white));
+        body.setTextColor(getColor(R.color.valanium_white));
         body.setTextSize(14);
 
         TextView when = new TextView(this);
         when.setText(java.text.DateFormat.getDateTimeInstance(
                 java.text.DateFormat.SHORT, java.text.DateFormat.SHORT)
                 .format(new java.util.Date(post.optLong("createdAt"))));
-        when.setTextColor(getColor(R.color.obsidian_muted));
+        when.setTextColor(getColor(R.color.valanium_muted));
         when.setTextSize(10);
         LinearLayout.LayoutParams whenParams = new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
@@ -4930,7 +5046,7 @@ public final class MainActivity extends Activity implements Events.Listener {
         if (pending == 0) {
             TextView empty = new TextView(this);
             empty.setText(R.string.requests_none);
-            empty.setTextColor(getColor(R.color.obsidian_dim));
+            empty.setTextColor(getColor(R.color.valanium_dim));
             empty.setTextSize(11);
             empty.setGravity(Gravity.CENTER);
             empty.setPadding(0, dp(18), 0, dp(18));
@@ -4951,20 +5067,20 @@ public final class MainActivity extends Activity implements Events.Listener {
 
         TextView name = new TextView(this);
         name.setText(entry.isNull("display_name") ? displayName(device) : entry.optString("display_name"));
-        name.setTextColor(getColor(R.color.obsidian_white));
+        name.setTextColor(getColor(R.color.valanium_white));
         name.setTextSize(13);
         card.addView(name);
 
         TextView who = new TextView(this);
         who.setText(entry.isNull("username") ? shortHex(device) : "@" + entry.optString("username"));
-        who.setTextColor(getColor(R.color.obsidian_muted));
+        who.setTextColor(getColor(R.color.valanium_muted));
         who.setTextSize(10);
         card.addView(who);
 
         if (!entry.isNull("origin")) {
             TextView origin = new TextView(this);
             origin.setText(entry.optString("origin"));
-            origin.setTextColor(getColor(R.color.obsidian_dim));
+            origin.setTextColor(getColor(R.color.valanium_dim));
             origin.setTextSize(10);
             LinearLayout.LayoutParams originParams = new LinearLayout.LayoutParams(
                     LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
@@ -4993,7 +5109,7 @@ public final class MainActivity extends Activity implements Events.Listener {
     }
 
     private Button requestButton(int caption, int leftMargin, Runnable action) {
-        Button button = new Button(this, null, 0, R.style.Obsidian_Segment);
+        Button button = new Button(this, null, 0, R.style.Valanium_Segment);
         button.setText(caption);
         LinearLayout.LayoutParams params =
                 new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.MATCH_PARENT, 1f);
@@ -5033,7 +5149,7 @@ public final class MainActivity extends Activity implements Events.Listener {
     }
 
     private void showInvite(JSONObject invite) {
-        String link = "obsidian://invite/" + invite.optString("pass");
+        String link = "valanium://invite/" + invite.optString("pass");
         new AlertDialog.Builder(this)
                 .setTitle(R.string.invites_open)
                 .setMessage(link)

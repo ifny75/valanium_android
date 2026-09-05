@@ -1,9 +1,9 @@
-package app.obsidian.core;
+package app.valanium.core;
 
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 /**
- * Мост к obsidian-core. Ни криптографии, ни ключей, ни протокола здесь нет —
+ * Мост к valanium-core. Ни криптографии, ни ключей, ни протокола здесь нет —
  * всё это живёт в Rust. Наружу торчат команды и события в JSON.
  *
  * <p>События забираются опросом, а не колбэком: колбэк из Rust-потока в JVM
@@ -18,12 +18,14 @@ import java.util.concurrent.locks.ReentrantReadWriteLock;
 public final class Core {
 
     static {
-        System.loadLibrary("obsidian");
+        System.loadLibrary("valanium");
     }
 
     private static native long nativeInit(String dbPath, String password);
 
     private static native boolean nativeVerifyDatabaseKey(String dbPath, String password);
+
+    private static native boolean nativeVerifyRelease(String manifest, String signature);
 
     private static native int nativeSubmit(long handle, String json);
 
@@ -58,6 +60,11 @@ public final class Core {
     /** Проверяет старый пароль по зашифрованному keyring до сохранения в Keystore. */
     public boolean verifyDatabaseKey(String dbPath, String password) {
         return nativeVerifyDatabaseKey(dbPath, password);
+    }
+
+    /** Проверяет точные байты манифеста закреплённым offline release-ключом. */
+    public boolean verifyRelease(String manifest, String signature) {
+        return nativeVerifyRelease(manifest, signature);
     }
 
     public boolean isOpen() {

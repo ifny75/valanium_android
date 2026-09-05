@@ -12,3 +12,6 @@ app/src/main/jniLibs/
 *.jks
 *.keystore
 keystore.properties
+
+# Путь к Android SDK у каждого свой.
+local.properties

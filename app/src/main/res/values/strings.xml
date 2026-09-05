@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <string name="app_name">Obsidian</string>
+    <string name="app_name">Valanium</string>
     <string name="private_circle">Public Beta</string>
     <string name="local_storage">Локальное хранилище</string>
     <string name="boot_status">Входим в защищённый аккаунт…</string>
@@ -52,8 +52,8 @@
     <string name="transport_multihop_hint">Два узла · адрес знает только первый</string>
     <string name="transport_onion_title">Onion</string>
     <string name="transport_onion_card_hint">Единственный режим без Cloudflare</string>
-    <string name="transport_basic">Basic Obsidian · один relay → main</string>
-    <string name="transport_multihop">Multi-hop Obsidian · relay → relay → main</string>
+    <string name="transport_basic">Basic Valanium · один relay → main</string>
+    <string name="transport_multihop">Multi-hop Valanium · relay → relay → main</string>
     <string name="transport_onion">Onion · Tor → onion relay → main</string>
     <string name="transport_onion_hint">Для Onion запустите Orbot с SOCKS5 на 127.0.0.1:9050. Auto пробует Relay, Multi-hop и затем Onion. Имя .onion не отправляется системному DNS.</string>
     <string name="route_device">Устройство</string>
@@ -70,7 +70,7 @@
     <string name="dialogs_label">Диалоги</string>
     <string name="open_my_profile">Мой профиль · аватар, код и безопасность</string>
     <string name="my_profile">Мой профиль</string>
-    <string name="account_profile">Профиль Obsidian</string>
+    <string name="account_profile">Профиль Valanium</string>
     <string name="avatar_server_hint">Аватар хранится в вашем серверном профиле</string>
     <string name="appearance">Оформление</string>
     <string name="message_text_size">Размер текста сообщений</string>
@@ -107,7 +107,7 @@
     <string name="notification_connected">Защищённое соединение активно</string>
     <string name="channel_messages">Входящие сообщения</string>
     <string name="channel_messages_hint">Уведомления о новых защищённых сообщениях</string>
-    <string name="notification_new_message">Новое сообщение в Obsidian</string>
+    <string name="notification_new_message">Новое сообщение в Valanium</string>
     <string name="preview_image">Фотография</string>
     <string name="preview_voice">Голосовое сообщение</string>
     <string name="preview_message">Новое сообщение</string>
@@ -256,6 +256,11 @@
     <string name="wallpaper_rays">Лучи</string>
     <string name="username_free">Юзернейм не занят</string>
     <string name="security_section">Безопасность и вход</string>
+    <string name="revoke_devices_title">Другие устройства</string>
+    <string name="revoke_devices_hint">Отключает все остальные устройства и навсегда блокирует их старые ключи. Это устройство останется подключено.</string>
+    <string name="revoke_devices_action">Отключить другие</string>
+    <string name="revoke_devices_confirm">Отключить все остальные устройства? Вернуть их можно будет только как новые.</string>
+    <string name="revoke_devices_done">Другие устройства отключены: %1$d</string>
     <string name="admin_section">Панель администратора</string>
     <string name="emblem_label">Значок</string>
     <string name="profile_color_label">Цвет профиля</string>
@@ -346,4 +351,10 @@
     <string name="channel_close">Закрыть канал</string>
     <string name="channel_close_hint">Канал исчезнет вместе со всеми постами и подписками. Отменить это нечем.</string>
     <string name="channel_closed">Канал закрыт</string>
+    <string name="hop_title">Второй узел Multi-hop</string>
+    <string name="hop_hint">Какой узел говорит с main. Первый выбирает Cloudflare — он ближайший, и заменить его нечем. Имена те же, что на странице состояния сети.</string>
+    <string name="hop_note">Выбранный узел постоянен, а «Авто» меняет его сам. Постоянный путь заметнее: первый узел видит, что вы всегда уходите через один и тот же второй. Это выбор в пользу предсказуемости, а не анонимности.</string>
+    <string name="hop_auto">Авто</string>
+    <string name="hop_switched">Второй узел: %1$s</string>
+    <string name="hop_switched_auto">Второй узел выбирается сам</string>
 </resources>

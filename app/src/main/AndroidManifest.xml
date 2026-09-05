@@ -15,7 +15,7 @@
         android:icon="@mipmap/ic_launcher"
         android:label="@string/app_name"
         android:supportsRtl="true"
-        android:theme="@style/Obsidian.Theme">
+        android:theme="@style/Valanium.Theme">
 
         <!-- allowBackup="false" не случайность: автобэкап Google утащил бы
              зашифрованную базу вместе с ключами на чужие серверы.
@@ -37,7 +37,7 @@
         </activity>
 
         <service
-            android:name=".ObsidianService"
+            android:name=".ValaniumService"
             android:exported="false"
             android:foregroundServiceType="dataSync" />
     </application>

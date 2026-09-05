@@ -1,4 +1,4 @@
-package app.obsidian;
+package app.valanium;
 
 import android.app.KeyguardManager;
 import android.content.Context;
@@ -51,10 +51,10 @@ import javax.crypto.spec.GCMParameterSpec;
  */
 final class LocalSecretStore {
 
-    private static final String KEY_ALIAS = "obsidian.database.key.v1";
+    private static final String KEY_ALIAS = "valanium.database.key.v1";
     /** Тот же секрет, но под ключом, который система отдаёт только владельцу. */
-    private static final String LOCKED_ALIAS = "obsidian.database.key.locked.v1";
-    private static final String PREFS = "obsidian.secure.local";
+    private static final String LOCKED_ALIAS = "valanium.database.key.locked.v1";
+    private static final String PREFS = "valanium.secure.local";
     private static final String VALUE = "database_secret";
     private static final String IV = "database_secret_iv";
     /** Сколько секунд после подтверждения ключ остаётся доступным. 0 — замка нет. */

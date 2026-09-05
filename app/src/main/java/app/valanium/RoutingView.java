@@ -1,4 +1,4 @@
-package app.obsidian;
+package app.valanium;
 
 import android.animation.ValueAnimator;
 import android.content.Context;
