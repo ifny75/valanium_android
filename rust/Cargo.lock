@@ -5104,7 +5104,7 @@ dependencies = [
 [[package]]
 name = "valanium-core"
 version = "0.1.0"
-source = "git+https://github.com/ifny75/valanium_main?rev=6a172f306509c87c15ee3f5adcc4ba06ba35e923#6a172f306509c87c15ee3f5adcc4ba06ba35e923"
+source = "git+https://github.com/ifny75/valanium_main?rev=00f586bb5ae4ca0e366cb51b547352b5fd9b0f44#00f586bb5ae4ca0e366cb51b547352b5fd9b0f44"
 dependencies = [
  "argon2",
  "arti-client",

@@ -13,7 +13,7 @@ crate-type = ["cdylib"]
 [dependencies]
 # Ядро живёт в своём репозитории. Ревизия пинится жёстко, а не веткой:
 # клиент обязан собираться тем же ядром, которым его собрали и подписали.
-valanium-core = { git = "https://github.com/ifny75/valanium_main", rev = "6a172f306509c87c15ee3f5adcc4ba06ba35e923" }
+valanium-core = { git = "https://github.com/ifny75/valanium_main", rev = "00f586bb5ae4ca0e366cb51b547352b5fd9b0f44" }
 jni = "0.21"
 hex = "0.4"
 # Нужен только для встроенного Tor: он поднимается в своей среде выполнения.
