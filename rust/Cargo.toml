@@ -12,16 +12,20 @@ crate-type = ["cdylib"]
 
 [dependencies]
 # Ядро живёт в своём репозитории. Ревизия пинится жёстко, а не веткой:
-# клиент обязан собираться тем же ядром, которым его собрали и подписали,
-# иначе «проверьте сами» перестаёт быть проверкой. Обновление ядра —
-# отдельный осознанный коммит сюда.
-valanium-core = { git = "https://github.com/ifny75/valanium_main", rev = "a557f8b8b06e74da17faa4aaadcc3971d7e6939c" }
+# клиент обязан собираться тем же ядром, которым его собрали и подписали.
+valanium-core = { git = "https://github.com/ifny75/valanium_main", rev = "6a172f306509c87c15ee3f5adcc4ba06ba35e923" }
 jni = "0.21"
 hex = "0.4"
+# Нужен только для встроенного Tor: он поднимается в своей среде выполнения.
+tokio = { version = "1", features = ["rt-multi-thread"], optional = true }
 
 [features]
 # Проброс фичи ядра: платный вход в TON по умолчанию выключен.
 ton = ["valanium-core/ton"]
+# Встроенный Tor. На Android он обязан ехать внутри: система с Android 10
+# запрещает исполнять файлы из каталога данных приложения, поэтому модель
+# «скачать бинарь и запустить», как на Windows, здесь неприменима.
+tor-embedded = ["valanium-core/tor-embedded", "dep:tokio"]
 
 [profile.release]
 opt-level = "z"
