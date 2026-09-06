@@ -5104,7 +5104,7 @@ dependencies = [
 [[package]]
 name = "valanium-core"
 version = "0.1.0"
-source = "git+https://github.com/ifny75/valanium_main?rev=00f586bb5ae4ca0e366cb51b547352b5fd9b0f44#00f586bb5ae4ca0e366cb51b547352b5fd9b0f44"
+source = "git+https://github.com/ifny75/valanium_main?rev=bdb0d6de3b3953df3145c8bee3511a0f13c35e84#bdb0d6de3b3953df3145c8bee3511a0f13c35e84"
 dependencies = [
  "argon2",
  "arti-client",
@@ -5129,6 +5129,8 @@ dependencies = [
  "tokio",
  "tokio-socks",
  "tokio-tungstenite",
+ "tor-linkspec",
+ "tor-proto",
  "tor-rtcompat",
  "zeroize",
 ]
