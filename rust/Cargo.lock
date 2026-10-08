@@ -1153,7 +1153,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2869,7 +2869,7 @@ dependencies = [
  "derive-deftly",
  "libc",
  "paste",
- "thiserror 1.0.69",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -5104,7 +5104,7 @@ dependencies = [
 [[package]]
 name = "valanium-core"
 version = "0.1.0"
-source = "git+https://github.com/ifny75/valanium_main?rev=bdb0d6de3b3953df3145c8bee3511a0f13c35e84#bdb0d6de3b3953df3145c8bee3511a0f13c35e84"
+source = "git+https://github.com/ifny75/valanium_main?rev=928aab4773926dc463f635725702c2cd2de09fad#928aab4773926dc463f635725702c2cd2de09fad"
 dependencies = [
  "argon2",
  "arti-client",

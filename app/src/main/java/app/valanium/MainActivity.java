@@ -6,6 +6,8 @@ import android.Manifest;
 import android.content.pm.PackageManager;
 import android.content.Intent;
 import android.net.Uri;
+import android.net.ConnectivityManager;
+import android.net.Network;
 import android.content.SharedPreferences;
 import android.content.res.ColorStateList;
 import android.graphics.Bitmap;
@@ -30,11 +32,15 @@ import android.view.View;
 import android.view.ViewGroup;
 import android.view.Window;
 import android.view.WindowInsets;
+import android.view.MotionEvent;
 import android.widget.Button;
 import android.widget.EditText;
 import android.widget.FrameLayout;
 import android.widget.ImageView;
 import android.widget.LinearLayout;
+import android.widget.ListView;
+import android.widget.HorizontalScrollView;
+import android.widget.PopupWindow;
 import android.widget.ScrollView;
 import android.widget.SeekBar;
 import android.widget.Switch;
@@ -72,9 +78,10 @@ public final class MainActivity extends Activity implements Events.Listener {
     private static long backgroundedAt = -1L;
     private boolean foregroundAuthorized;
     private boolean warmCoreUnlock;
+    private ConnectivityManager.NetworkCallback networkCallback;
+    private volatile boolean networkWasLost;
 
     private static final String SERVER_BASIC_URL = "wss://valanium.com/ws";
-    private static final String SERVER_MULTIHOP_URL = "wss://valanium.com/multihop/ws";
     /*
       Адреса onion-входа здесь нет намеренно: их несколько, они меняются вместе
       с узлами, и сервер называет их сам в HELLO. Приложение просит режим, а
@@ -83,22 +90,23 @@ public final class MainActivity extends Activity implements Events.Listener {
     private static final String SERVER_ONION_URL = "valanium://onion";
     private static final String SERVER_AUTO_URL = "valanium://auto";
     private static final String TRANSPORT_KEY = "transport";
+    private static final int LEGACY_VIOLET = Color.rgb(124, 0, 255);
+    private static final int FRIENDLY_VIOLET = Color.rgb(151, 112, 255);
     /** Какой узел выбран вторым плечом. Пусто — выбирает сеть. */
     private static final String HOP_KEY = "multihop_node";
     /** Имена те же, что на странице состояния сети: человек выбирает из них же. */
     private static final String[] HOP_NODES = { "alpha", "beta", "gamma" };
-    private static final String[] HOP_ADDRESSES = { "2.26.55.48", "31.76.21.148", "31.76.29.56" };
-    private static final String MAIN_ADDRESS = "2.27.205.8";
     private static final String RELEASES_URL = "https://valanium.com/v1/releases/latest";
     /** Сколько сообщений поднимать за раз. Остальное — по прокрутке вверх. */
     private static final int HISTORY_PAGE = 40;
+    private final Set<String> refreshRequests = new HashSet<>();
 
     /**
      * Уже поднятая переписка — на время сеанса.
      *
-     * Хранятся готовые пузыри, поэтому повторное открытие чата не стоит ничего:
-     * ни обращения к ядру, ни расшифровки, ни повторного разбора base64 у фото
-     * и голосовых. Только в памяти и намеренно: расшифрованный текст в
+     * Хранятся лёгкие модели строк, а View существуют только в видимой области.
+     * Повторное открытие не обращается к ядру, а фото декодируются в ограниченный
+     * LRU-кэш превью. Всё только в памяти и намеренно: расшифрованный текст в
      * SharedPreferences пережил бы закрытие приложения и обошёл бы весь смысл
      * запечатанной базы.
      */
@@ -150,6 +158,8 @@ public final class MainActivity extends Activity implements Events.Listener {
 
     /** Нижний островок: три корневых экрана и размытая подложка. */
     private BlurPanel tabBar;
+    /** Продолжение верхней панели под прозрачной системной строкой Android 15. */
+    private View statusBarPanel;
 
     /** Признаёт ли сервер это устройство владельцем. Решает сервер, не мы. */
     private boolean admin;
@@ -183,6 +193,8 @@ public final class MainActivity extends Activity implements Events.Listener {
      * взгляд теряет, где он оказался.
      */
     private int navDirection = 1;
+    /** Не переигрывать motion выбранной вкладки при обычной перекраске экрана. */
+    private int activeNavigation = View.NO_ID;
 
     /** Чем сейчас отфильтрован список переписок. Пусто — показываем всё. */
     private String listFilter = "";
@@ -193,17 +205,98 @@ public final class MainActivity extends Activity implements Events.Listener {
     private boolean lookupMissed;
     private Runnable lookupSoon;
     private LinearLayout privacyGroups;
-    private LinearLayout requestList;
+    private ListView requestList;
+
+    private static final int CHAT_ROW_SEARCH = 0;
+    private static final int CHAT_ROW_NOTICE = 1;
+    private static final int CHAT_ROW_EMPTY = 2;
+    private static final int CHAT_ROW_ACTION = 3;
+    private static final int CHAT_ROW_PEER = 4;
+
+    /** Модель строки списка диалогов; View в ней намеренно нет. */
+    private static final class ChatListItem {
+        final int kind;
+        final String peer;
+        final String text;
+        final JSONObject search;
+        final int action;
+
+        private ChatListItem(int kind, String peer, String text, JSONObject search, int action) {
+            this.kind = kind;
+            this.peer = peer;
+            this.text = text;
+            this.search = search;
+            this.action = action;
+        }
+
+        static ChatListItem search(JSONObject value) {
+            return new ChatListItem(CHAT_ROW_SEARCH, null, null, value, 0);
+        }
+
+        static ChatListItem notice(String value) {
+            return new ChatListItem(CHAT_ROW_NOTICE, null, value, null, 0);
+        }
+
+        static ChatListItem empty() {
+            return new ChatListItem(CHAT_ROW_EMPTY, null, null, null, 0);
+        }
+
+        static ChatListItem action(String label, int action) {
+            return new ChatListItem(CHAT_ROW_ACTION, null, label, null, action);
+        }
+
+        static ChatListItem peer(String peer) {
+            return new ChatListItem(CHAT_ROW_PEER, peer, null, null, 0);
+        }
+    }
+
+    private static final class RequestListItem {
+        final String device;
+        final JSONObject entry;
+
+        RequestListItem(String device, JSONObject entry) {
+            this.device = device;
+            this.entry = entry;
+        }
+    }
+
+    /** Одна строка виртуализированной ленты. Расшифрованный текст живёт только в памяти. */
+    private static final class TimelineItem {
+        final boolean separator;
+        final String body;
+        final boolean outgoing;
+        final long timestamp;
+        final String id;
+        int bottomMarginDp = 8;
+
+        private TimelineItem(boolean separator, String body, boolean outgoing,
+                long timestamp, String id) {
+            this.separator = separator;
+            this.body = body;
+            this.outgoing = outgoing;
+            this.timestamp = timestamp;
+            this.id = id;
+        }
+
+        static TimelineItem separator(long timestamp) {
+            return new TimelineItem(true, null, false, timestamp, null);
+        }
+
+        static TimelineItem message(String body, boolean outgoing, long timestamp, String id) {
+            return new TimelineItem(false, body, outgoing, timestamp, id);
+        }
+    }
 
     /** Состояние одной беседы в кэше. */
     private static final class ChatPage {
-        final List<View> bubbles = new ArrayList<>();
+        final List<TimelineItem> timeline = new ArrayList<>();
         String oldest;
         boolean hasMore = true;
         boolean loading;
         boolean loaded;
         /** Отрицательное — «прокрутить вниз», как при первом открытии. */
-        int scrollY = -1;
+        int firstVisible = -1;
+        int topOffset;
     }
 
     private ChatPage page(String conversation) {
@@ -240,9 +333,13 @@ public final class MainActivity extends Activity implements Events.Listener {
     private View status;
     private String statusText = "";
     private EditText newPeer;
-    private LinearLayout contactList;
-    private LinearLayout messages;
-    private ScrollView messagesScroll;
+    private ListView contactList;
+    private ListView messagesList;
+    private VirtualListAdapter<ChatListItem> chatListAdapter;
+    private VirtualListAdapter<RequestListItem> requestListAdapter;
+    private VirtualListAdapter<TimelineItem> messageListAdapter;
+    /** Не принимать служебную перекладку адаптера за прокрутку человека к началу. */
+    private boolean messagePagingEnabled;
     private View scrollToBottom;
     private EditText composer;
     private TextView peerName;
@@ -296,6 +393,13 @@ public final class MainActivity extends Activity implements Events.Listener {
     private SharedPreferences appearancePreferences;
     private final Set<String> readIds = new HashSet<>();
     private final Set<String> sentReadIds = new HashSet<>();
+    /** Ограниченный кэш превью; полноразмерные расшифрованные Bitmap не удерживаем. */
+    private final android.util.LruCache<String, Bitmap> messageThumbnails =
+            new android.util.LruCache<String, Bitmap>(12 * 1024) {
+                @Override protected int sizeOf(String key, Bitmap value) {
+                    return Math.max(1, value.getByteCount() / 1024);
+                }
+            };
 
     private String currentPeer;
     private String myDeviceHex = "";
@@ -303,6 +407,7 @@ public final class MainActivity extends Activity implements Events.Listener {
     private String ownChatCode = "";
     private String pendingChatCode;
     private boolean profilesSupported;
+    private boolean migratedMultiHop;
     private volatile boolean localPolling;
     private Thread localPoller;
 
@@ -344,8 +449,8 @@ public final class MainActivity extends Activity implements Events.Listener {
         status.setOnClickListener(v -> toast(statusText));
         newPeer = findViewById(R.id.new_peer);
         contactList = findViewById(R.id.contact_list);
-        messages = findViewById(R.id.messages);
-        messagesScroll = findViewById(R.id.messages_scroll);
+        messagesList = findViewById(R.id.messages_scroll);
+        configureVirtualLists();
         scrollToBottom = findViewById(R.id.scroll_to_bottom);
         composer = findViewById(R.id.composer);
         peerName = findViewById(R.id.peer_name);
@@ -471,6 +576,7 @@ public final class MainActivity extends Activity implements Events.Listener {
         findViewById(R.id.avatar_upload).setOnClickListener(v -> chooseAvatar());
         findViewById(R.id.profile_avatar).setOnClickListener(v -> showOwnAvatarOrChoose());
         findViewById(R.id.attach_photo).setOnClickListener(v -> choosePhoto());
+        findViewById(R.id.open_calculator).setOnClickListener(this::showCalculator);
         findViewById(R.id.verify_peer).setOnClickListener(v -> { if (currentPeer != null) submit(Commands.verify(currentPeer)); });
         configureRecovery();
         findViewById(R.id.revoke_other_devices).setOnClickListener(v ->
@@ -508,14 +614,26 @@ public final class MainActivity extends Activity implements Events.Listener {
                 }
                 android.widget.FrameLayout.LayoutParams params =
                         (android.widget.FrameLayout.LayoutParams) page.getLayoutParams();
-                if (params.bottomMargin != reserve) {
-                    params.bottomMargin = reserve;
+                if (params.bottomMargin != 0) {
+                    params.bottomMargin = 0;
                     page.setLayoutParams(params);
+                }
+                if (page instanceof ViewGroup) ((ViewGroup) page).setClipToPadding(false);
+                if (page.getPaddingBottom() != reserve) {
+                    page.setPadding(page.getPaddingLeft(), page.getPaddingTop(),
+                            page.getPaddingRight(), reserve);
                 }
             }
         });
 
         show(screenBoot);
+        if (migratedMultiHop) {
+            new AlertDialog.Builder(this)
+                    .setTitle(R.string.route_migrated_title)
+                    .setMessage(R.string.route_migrated_message)
+                    .setPositiveButton(R.string.ok, null)
+                    .show();
+        }
         requestNotificationPermission();
         try {
             if (!ValaniumService.isSigningOut() && !ValaniumService.core().isOpen()) {
@@ -550,6 +668,11 @@ public final class MainActivity extends Activity implements Events.Listener {
 
     @Override
     protected void onStop() {
+        if (networkCallback != null) {
+            ConnectivityManager manager = getSystemService(ConnectivityManager.class);
+            if (manager != null) manager.unregisterNetworkCallback(networkCallback);
+            networkCallback = null;
+        }
         backgroundedAt = SystemClock.elapsedRealtime();
         foregroundAuthorized = false;
         stopRecording(false);
@@ -599,19 +722,123 @@ public final class MainActivity extends Activity implements Events.Listener {
     }
 
     private void configureInsets() {
-        if (Build.VERSION.SDK_INT < 30) return;
         View root = findViewById(R.id.app_root);
+        if (root instanceof ViewGroup) ((ViewGroup) root).setClipChildren(false);
+        FrameLayout windowContent = findViewById(android.R.id.content);
+        if (windowContent != null) {
+            statusBarPanel = new View(this);
+            windowContent.addView(statusBarPanel,
+                    new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0));
+        }
+        root.addOnLayoutChangeListener((view, left, top, right, bottom,
+                oldLeft, oldTop, oldRight, oldBottom) -> layoutTopBars());
+        if (Build.VERSION.SDK_INT < 30) {
+            root.post(this::layoutTopBars);
+            return;
+        }
         root.setOnApplyWindowInsetsListener((view, windowInsets) -> {
             Insets bars = windowInsets.getInsets(WindowInsets.Type.systemBars());
             Insets ime = windowInsets.getInsets(WindowInsets.Type.ime());
-            view.setPadding(dp(16), bars.top + dp(8), dp(16),
+            view.setPadding(dp(16), bars.top, dp(16),
                     Math.max(bars.bottom, ime.bottom) + dp(8));
+            layoutStatusBarPanel(view, bars.top);
+            view.post(this::layoutTopBars);
             if (ime.bottom > 0 && screenConversation.getVisibility() == View.VISIBLE) {
                 ui.post(() -> scrollToLatest(false));
             }
             return windowInsets;
         });
         root.requestApplyInsets();
+    }
+
+    private void layoutStatusBarPanel(View root, int statusBarHeight) {
+        if (statusBarPanel == null) return;
+        ViewGroup.LayoutParams params = statusBarPanel.getLayoutParams();
+        // Панель добавлена прямо в android.R.id.content, вне внутренних полей
+        // app_root, поэтому MATCH_PARENT действительно равен ширине дисплея.
+        params.width = ViewGroup.LayoutParams.MATCH_PARENT;
+        params.height = statusBarHeight;
+        statusBarPanel.setLayoutParams(params);
+        statusBarPanel.setBackgroundColor(systemTopColor());
+    }
+
+    /**
+     * Верхняя панель принадлежит окну, а не карточке экрана: растягиваем её
+     * поверх общих полей контента и разрешаем родителям рисовать за границами.
+     * Так все разделы остаются выровнены по 16 dp, но шапка касается обоих
+     * краёв и визуально продолжается системной строкой состояния.
+     */
+    private void layoutTopBars() {
+        View root = findViewById(R.id.app_root);
+        if (root == null || root.getWidth() == 0) return;
+        layoutTopBars(root, root, root.getWidth());
+    }
+
+    private void layoutTopBars(View view, View root, int windowWidth) {
+        if ("valanium_top_bar".equals(view.getTag())) {
+            ViewGroup.LayoutParams params = view.getLayoutParams();
+            if (params.width != windowWidth) {
+                params.width = windowWidth;
+                view.setLayoutParams(params);
+            }
+            view.setTranslationX(-root.getPaddingLeft());
+            for (android.view.ViewParent parent = view.getParent(); parent instanceof ViewGroup;
+                    parent = parent.getParent()) {
+                ViewGroup group = (ViewGroup) parent;
+                group.setClipChildren(false);
+                group.setClipToPadding(false);
+                if (group == root) break;
+            }
+            applyTopBarBackground(view);
+        }
+        if (view instanceof ViewGroup) {
+            ViewGroup group = (ViewGroup) view;
+            for (int i = 0; i < group.getChildCount(); i++) {
+                layoutTopBars(group.getChildAt(i), root, windowWidth);
+            }
+        }
+    }
+
+    /** Скругление только снизу: сверху панель составляет одно целое со status bar. */
+    private void applyTopBarBackground(View view) {
+        GradientDrawable background = new GradientDrawable();
+        background.setColor(topBarColor());
+        float radius = dp(22);
+        background.setCornerRadii(new float[]{0, 0, 0, 0, radius, radius, radius, radius});
+        view.setBackground(background);
+        view.setElevation(0f);
+    }
+
+    /** Один оттенок у системной области и самой панели — без горизонтального шва. */
+    private int topBarColor() {
+        int panel = themePanel();
+        return "black".equals(themeName()) ? panel : blend(panel, accentColor(), .94f);
+    }
+
+    private int systemTopColor() {
+        return containsTopBar(currentScreen) ? topBarColor() : themeBackground();
+    }
+
+    private boolean containsTopBar(View view) {
+        return findTopBar(view) != null;
+    }
+
+    private View findTopBar(View view) {
+        if (view == null) return null;
+        if ("valanium_top_bar".equals(view.getTag())) return view;
+        if (!(view instanceof ViewGroup)) return null;
+        ViewGroup group = (ViewGroup) view;
+        for (int i = 0; i < group.getChildCount(); i++) {
+            View found = findTopBar(group.getChildAt(i));
+            if (found != null) return found;
+        }
+        return null;
+    }
+
+    private void updateSystemTopSurface() {
+        int color = systemTopColor();
+        getWindow().setStatusBarColor(color);
+        if (statusBarPanel != null) statusBarPanel.setBackgroundColor(color);
     }
 
     /** Первый экран остаётся чисто клиентской композицией: логика регистрации не меняется. */
@@ -658,6 +885,19 @@ public final class MainActivity extends Activity implements Events.Listener {
     private void configurePreferences() {
         SharedPreferences preferences = getSharedPreferences("appearance", MODE_PRIVATE);
         appearancePreferences = preferences;
+        if ("multihop".equals(preferences.getString(TRANSPORT_KEY, "auto"))) {
+            preferences.edit().putString(TRANSPORT_KEY, "basic").remove(HOP_KEY).apply();
+            migratedMultiHop = true;
+        }
+        if (!preferences.getBoolean("friendly_visual_v1", false)) {
+            SharedPreferences.Editor visual = preferences.edit();
+            if (!preferences.contains("accent_color")
+                    || preferences.getInt("accent_color", LEGACY_VIOLET) == LEGACY_VIOLET) {
+                visual.putInt("accent_color", FRIENDLY_VIOLET);
+            }
+            if (!preferences.contains("dividers")) visual.putString("dividers", "soft");
+            visual.putBoolean("friendly_visual_v1", true).apply();
+        }
         int savedTextSize = preferences.contains("message_text_size")
                 ? preferences.getInt("message_text_size", 15)
                 : (preferences.getBoolean("large_text", false) ? 18 : 15);
@@ -701,7 +941,7 @@ public final class MainActivity extends Activity implements Events.Listener {
         });
         findViewById(R.id.accent_white).setOnClickListener(v -> setAccent(Color.rgb(244,244,244)));
         findViewById(R.id.accent_blue).setOnClickListener(v -> setAccent(Color.rgb(112,168,255)));
-        findViewById(R.id.accent_violet).setOnClickListener(v -> setAccent(Color.rgb(124,0,255)));
+        findViewById(R.id.accent_violet).setOnClickListener(v -> setAccent(FRIENDLY_VIOLET));
         findViewById(R.id.accent_green).setOnClickListener(v -> setAccent(Color.rgb(103,212,163)));
         findViewById(R.id.accent_coral).setOnClickListener(v -> setAccent(Color.rgb(237,134,116)));
         findViewById(R.id.dividers_full).setOnClickListener(v -> setDividers("full"));
@@ -765,71 +1005,70 @@ public final class MainActivity extends Activity implements Events.Listener {
 
         applyInterfaceScale(findViewById(R.id.app_root), (interfaceScale.getProgress() + 85) / 100f);
         applyTheme();
-        applyAccent();
         applyDividers();
+        applyAccent();
         applyPreferencePreview();
         applyWallpaper();
         installPressFeedback(findViewById(R.id.app_root));
-        // Список диалогов перестраивается целиком — без этого строки появляются
-        // и исчезают рывком.
-        contactList.setLayoutTransition(new android.animation.LayoutTransition());
-        // Под островком меняется картинка — значит, размытие надо пересчитать.
-        ((View) contactList.getParent()).setOnScrollChangeListener(
-                (view, x, y, oldX, oldY) -> tabBar.invalidate());
+        android.widget.AbsListView.OnScrollListener blurInvalidator =
+                new android.widget.AbsListView.OnScrollListener() {
+                    @Override public void onScrollStateChanged(android.widget.AbsListView view, int state) {}
+                    @Override public void onScroll(android.widget.AbsListView view, int first,
+                            int visible, int total) {
+                        if (tabBar != null) tabBar.invalidate();
+                    }
+                };
+        contactList.setOnScrollListener(blurInvalidator);
+        requestList.setOnScrollListener(blurInvalidator);
 
         // Догрузка старого — по приближении к верху, а не по достижению.
-        // Запас в один экран нужен, чтобы страница успела прийти до того, как
-        // человек упрётся в пустоту: обращение к ядру асинхронное, и «дожать до
-        // края и ждать» читается как зависание.
-        messagesScroll.setOnScrollChangeListener((view, x, y, oldX, oldY) -> {
-            updateScrollToBottom(y);
-            if (y >= oldY || currentPeer == null) return;
-            String conversation = conversations.get(currentPeer);
-            if (conversation != null && y < messagesScroll.getHeight()) loadOlder(conversation);
+        messagesList.setOnScrollListener(new android.widget.AbsListView.OnScrollListener() {
+            @Override public void onScrollStateChanged(android.widget.AbsListView view, int state) {}
+
+            @Override public void onScroll(android.widget.AbsListView view, int first,
+                    int visible, int total) {
+                updateScrollToBottom(first, visible, total);
+                if (!messagePagingEnabled || currentPeer == null || first > 3) return;
+                String conversation = conversations.get(currentPeer);
+                if (conversation != null) loadOlder(conversation);
+            }
         });
     }
 
     private String serverUrl() {
         SharedPreferences preferences = appearancePreferences == null
                 ? getSharedPreferences("appearance", MODE_PRIVATE) : appearancePreferences;
-        String mode = preferences.getString(TRANSPORT_KEY, "onion");
-        if ("multihop".equals(mode)) {
-            /*
-              Первый узел выбирает Cloudflare, и повлиять на это нечем: у всех
-              relay один общий адрес. А кому он передаст дальше — выбирает
-              человек.
-
-              Если Cloudflare привёл на тот самый узел, что выбран вторым, узел
-              отвечает 421: двух разных плеч из одного не сделать. Ядро сочтёт
-              это отказом соединения и попробует снова — следующая попытка
-              почти наверняка придёт на другой вход.
-            */
-            String hop = preferences.getString(HOP_KEY, "");
-            for (String node : HOP_NODES) {
-                if (node.equals(hop)) return "wss://valanium.com/multihop/" + node + "/ws";
-            }
-            return SERVER_MULTIHOP_URL;
-        }
+        String mode = preferences.getString(TRANSPORT_KEY, "auto");
+        if ("multihop".equals(mode)) return SERVER_BASIC_URL;
         if ("onion".equals(mode)) return SERVER_ONION_URL;
         if ("basic".equals(mode)) return SERVER_BASIC_URL;
         return SERVER_AUTO_URL;
     }
 
+    private void connectSelectedRoute() {
+        if ("onion".equals(appearancePreferences.getString(TRANSPORT_KEY, "auto"))) {
+            prewarmTor();
+        } else {
+            submit(Commands.connect(serverUrl()));
+        }
+    }
+
     private void configureTransport() {
         RoutingView routes = findViewById(R.id.transport_mode);
-        routes.setMode(appearancePreferences.getString(TRANSPORT_KEY, "onion"));
+        routes.setMode(appearancePreferences.getString(TRANSPORT_KEY, "auto"));
         routes.setOnModeChangedListener(mode -> {
-            if (mode.equals(appearancePreferences.getString(TRANSPORT_KEY, "onion"))) return;
+            if (mode.equals(appearancePreferences.getString(TRANSPORT_KEY, "auto"))) return;
             appearancePreferences.edit().putString(TRANSPORT_KEY, mode).apply();
             showHopCard();
             renderConnectionOverview();
             // Выбрали Onion — начинаем строить цепь немедленно, параллельно с
             // попыткой подключиться. Иначе первая попытка упрётся в неготовый Tor.
-            if ("onion".equals(mode)) prewarmTor();
             if (!myDeviceHex.isEmpty()) {
                 submit(Commands.disconnect());
                 setStatus(getString(R.string.transport_switching));
-                ui.postDelayed(() -> submit(Commands.connect(serverUrl())), 250);
+                ui.postDelayed(this::connectSelectedRoute, 250);
+            } else if ("onion".equals(mode)) {
+                prewarmTor();
             }
         });
         configureHopPicker();
@@ -840,7 +1079,7 @@ public final class MainActivity extends Activity implements Events.Listener {
         TextView state = findViewById(R.id.tor_circuit_state);
         LinearLayout host = findViewById(R.id.tor_circuit_nodes);
         host.removeAllViews();
-        if (!"onion".equals(appearancePreferences.getString(TRANSPORT_KEY, "onion"))) {
+        if (!"onion".equals(appearancePreferences.getString(TRANSPORT_KEY, "auto"))) {
             state.setText(R.string.tor_circuit_unused);
             host.addView(torCircuitNode("—", getString(R.string.transport_onion_title),
                     getString(R.string.tor_node_waiting_detail)));
@@ -861,20 +1100,15 @@ public final class MainActivity extends Activity implements Events.Listener {
             host.addView(torCircuitNode("0", getString(R.string.tor_node_device), Build.MODEL));
             if (hops != null) for (int i = 0; i < Math.min(8, hops.length()); i++) {
                 addTorConnector(host);
-                JSONArray ips = hops.optJSONArray(i);
-                StringBuilder addresses = new StringBuilder();
-                if (ips != null) for (int j = 0; j < ips.length(); j++) {
-                    if (j > 0) addresses.append("  ·  ");
-                    addresses.append(ips.optString(j));
-                }
                 host.addView(torCircuitNode(String.valueOf(i + 1),
                         i == 0 ? getString(R.string.tor_node_guard)
                                 : getString(R.string.tor_node_relay, i + 1),
-                        addresses.length() == 0 ? "—" : addresses.toString()));
+                        getString(R.string.node_address_hidden)));
             }
             addTorConnector(host);
             host.addView(torCircuitNode(String.valueOf((hops == null ? 0 : Math.min(8, hops.length())) + 1),
-                    getString(R.string.tor_node_destination), circuit.optString("destination", "—")));
+                    getString(R.string.tor_node_destination),
+                    getString(R.string.node_address_hidden)));
         } catch (Throwable error) {
             state.setText(R.string.tor_circuit_unavailable);
             host.addView(torCircuitNode("!", getString(R.string.tor_node_device),
@@ -937,11 +1171,11 @@ public final class MainActivity extends Activity implements Events.Listener {
         host.addView(connector, params);
     }
 
-    /** Показывает известный клиенту маршрут, не выдавая список адресов за health-check. */
+    /** Показывает роли маршрута, не раскрывая публично адреса инфраструктуры. */
     private void renderConnectionOverview() {
         TextView state = findViewById(R.id.connection_state);
         if (state == null || appearancePreferences == null) return;
-        String mode = appearancePreferences.getString(TRANSPORT_KEY, "onion");
+        String mode = appearancePreferences.getString(TRANSPORT_KEY, "auto");
         String route;
         String privacy;
         if ("basic".equals(mode)) {
@@ -953,7 +1187,7 @@ public final class MainActivity extends Activity implements Events.Listener {
             for (int i = 0; i < HOP_NODES.length; i++) if (HOP_NODES[i].equals(hop)) index = i;
             route = index < 0 ? getString(R.string.route_multihop_auto_summary)
                     : getString(R.string.route_multihop_node_summary,
-                            Character.toUpperCase(hop.charAt(0)) + hop.substring(1), HOP_ADDRESSES[index]);
+                            Character.toUpperCase(hop.charAt(0)) + hop.substring(1));
             privacy = getString(R.string.route_multihop_privacy);
         } else if ("onion".equals(mode)) {
             route = getString(R.string.route_onion_summary);
@@ -967,14 +1201,10 @@ public final class MainActivity extends Activity implements Events.Listener {
                 getString(R.string.connection_device_route, Build.MODEL, route));
         ((TextView) findViewById(R.id.connection_route_privacy)).setText(privacy);
         ((TextView) findViewById(R.id.connection_destination)).setText(
-                getString(R.string.connection_destination, MAIN_ADDRESS));
-        StringBuilder infrastructure = new StringBuilder();
-        for (int i = 0; i < HOP_NODES.length; i++) {
-            if (i > 0) infrastructure.append('\n');
-            String name = Character.toUpperCase(HOP_NODES[i].charAt(0)) + HOP_NODES[i].substring(1);
-            infrastructure.append(String.format(Locale.ROOT, "%-7s %s", name, HOP_ADDRESSES[i]));
-        }
-        infrastructure.append('\n').append(String.format(Locale.ROOT, "%-7s %s", "Main", MAIN_ADDRESS));
+                R.string.connection_addresses_hidden);
+        StringBuilder infrastructure = new StringBuilder(getString(R.string.infrastructure_relay, "hop1"));
+        infrastructure.append('\n').append(getString(R.string.infrastructure_relay, "hop3"));
+        infrastructure.append('\n').append(getString(R.string.infrastructure_main));
         ((TextView) findViewById(R.id.connection_nodes)).setText(infrastructure);
         View dot = findViewById(R.id.connection_status_dot);
         int color = getString(R.string.status_online).equals(statusText)
@@ -1004,7 +1234,7 @@ public final class MainActivity extends Activity implements Events.Listener {
      */
     private void prewarmTor() {
         if (torWarming) return;
-        if (!"onion".equals(appearancePreferences.getString(TRANSPORT_KEY, "onion"))) return;
+        if (!"onion".equals(appearancePreferences.getString(TRANSPORT_KEY, "auto"))) return;
         torWarming = true;
         // Состояние Tor — рядом с базой, а не в общем кэше: среди него
         // guards.json, то есть список входных узлов этого человека.
@@ -1023,7 +1253,10 @@ public final class MainActivity extends Activity implements Events.Listener {
             final boolean ready = socks != null && !socks.isEmpty();
             torWarming = false;
             runOnUiThread(() -> {
-                if (!"onion".equals(appearancePreferences.getString(TRANSPORT_KEY, "onion"))) return;
+                if (!"onion".equals(appearancePreferences.getString(TRANSPORT_KEY, "auto"))) return;
+                if (ready && !myDeviceHex.isEmpty() && foregroundAuthorized) {
+                    submit(Commands.connect(SERVER_ONION_URL));
+                }
                 if (!getString(R.string.status_online).equals(statusText)) {
                     setStatus(getString(ready ? R.string.tor_ready : R.string.tor_failed));
                 }
@@ -1050,7 +1283,7 @@ public final class MainActivity extends Activity implements Events.Listener {
     private void showHopCard() {
         View card = findViewById(R.id.hop_card);
         if (card == null) return;
-        boolean multihop = "multihop".equals(appearancePreferences.getString(TRANSPORT_KEY, "onion"));
+        boolean multihop = "multihop".equals(appearancePreferences.getString(TRANSPORT_KEY, "auto"));
         card.setVisibility(multihop ? View.VISIBLE : View.GONE);
         if (multihop) markChosenHop();
     }
@@ -1074,7 +1307,7 @@ public final class MainActivity extends Activity implements Events.Listener {
         if (myDeviceHex.isEmpty()) return;
         submit(Commands.disconnect());
         setStatus(getString(R.string.transport_switching));
-        ui.postDelayed(() -> submit(Commands.connect(serverUrl())), 250);
+        ui.postDelayed(this::connectSelectedRoute, 250);
     }
 
     // --- тема ------------------------------------------------------------------
@@ -1094,8 +1327,8 @@ public final class MainActivity extends Activity implements Events.Listener {
     private int themeBackground() {
         switch (themeName()) {
             case "black": return Color.rgb(0, 0, 0);
-            case "light": return Color.rgb(242, 242, 240);
-            default: return Color.rgb(8, 6, 12);
+            case "light": return Color.rgb(246, 244, 248);
+            default: return Color.rgb(11, 8, 16);
         }
     }
 
@@ -1103,7 +1336,7 @@ public final class MainActivity extends Activity implements Events.Listener {
         switch (themeName()) {
             case "black": return Color.rgb(7, 7, 7);
             case "light": return Color.rgb(255, 255, 255);
-            default: return Color.rgb(19, 16, 25);
+            default: return Color.rgb(26, 21, 34);
         }
     }
 
@@ -1111,8 +1344,8 @@ public final class MainActivity extends Activity implements Events.Listener {
     private int themeIncomingBubble() {
         switch (themeName()) {
             case "black": return Color.rgb(16, 16, 16);
-            case "light": return Color.rgb(232, 232, 229);
-            default: return Color.rgb(22, 22, 22);
+            case "light": return Color.rgb(238, 234, 242);
+            default: return Color.rgb(31, 26, 38);
         }
     }
 
@@ -1130,8 +1363,22 @@ public final class MainActivity extends Activity implements Events.Listener {
 
     private void applyTheme() {
         int background = themeBackground();
-        findViewById(R.id.app_root).setBackgroundColor(background);
-        getWindow().setStatusBarColor(background);
+        View root = findViewById(R.id.app_root);
+        if ("black".equals(themeName())) {
+            root.setBackgroundColor(background);
+        } else {
+            GradientDrawable ambience = new GradientDrawable(
+                    GradientDrawable.Orientation.TL_BR,
+                    new int[]{
+                            blend(background, accentColor(), .94f),
+                            background,
+                            blend(background, Color.rgb(238, 134, 116), .97f),
+                    });
+            root.setBackground(ambience);
+        }
+        // Верхняя панель начинается сразу под системными значками; одинаковый
+        // цвет убирает видимый шов и превращает их в одну полноширинную шапку.
+        updateSystemTopSurface();
         getWindow().setNavigationBarColor(background);
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             android.view.WindowInsetsController controller =
@@ -1145,6 +1392,7 @@ public final class MainActivity extends Activity implements Events.Listener {
             }
         }
         applyThemeText(findViewById(R.id.app_root));
+        layoutTopBars();
     }
 
     /**
@@ -1416,13 +1664,16 @@ public final class MainActivity extends Activity implements Events.Listener {
     }
 
     private int accentColor() {
-        return appearancePreferences == null ? Color.rgb(124,0,255)
-                : appearancePreferences.getInt("accent_color", Color.rgb(124,0,255));
+        return appearancePreferences == null ? FRIENDLY_VIOLET
+                : appearancePreferences.getInt("accent_color", FRIENDLY_VIOLET);
     }
 
     private void setAccent(int color) {
         appearancePreferences.edit().putInt("accent_color", color).apply();
+        applyTheme();
+        applyDividers();
         applyAccent();
+        applyPreferencePreview();
         renderPeers();
         reloadHistory();
     }
@@ -1452,7 +1703,6 @@ public final class MainActivity extends Activity implements Events.Listener {
         ImageView add = findViewById(R.id.open_chat);
         add.setBackgroundTintList(ColorStateList.valueOf(accent));
         add.setImageTintList(ColorStateList.valueOf(text));
-        settingsPreviewOut.setBackgroundTintList(ColorStateList.valueOf(accent));
         settingsPreviewOut.setTextColor(text);
         messageTextSize.setProgressTintList(ColorStateList.valueOf(accent));
         messageWidth.setProgressTintList(ColorStateList.valueOf(accent));
@@ -1463,7 +1713,7 @@ public final class MainActivity extends Activity implements Events.Listener {
         highlightSegment(recoverByCode ? R.id.recover_mode_code : R.id.recover_mode_password,
                 R.id.recover_mode_code, R.id.recover_mode_password);
         highlightSegment(themeButtonId(), R.id.theme_dark, R.id.theme_black, R.id.theme_light);
-        String dividers = appearancePreferences.getString("dividers", "full");
+        String dividers = appearancePreferences.getString("dividers", "soft");
         highlightSegment("soft".equals(dividers) ? R.id.dividers_soft
                         : "none".equals(dividers) ? R.id.dividers_none : R.id.dividers_full,
                 R.id.dividers_full, R.id.dividers_soft, R.id.dividers_none);
@@ -1475,9 +1725,11 @@ public final class MainActivity extends Activity implements Events.Listener {
     }
 
     private void applyDividers() {
-        String mode = appearancePreferences.getString("dividers", "full");
+        String mode = appearancePreferences.getString("dividers", "soft");
         int line = "none".equals(mode) ? Color.TRANSPARENT
-                : ("soft".equals(mode) ? Color.rgb(24,24,24) : Color.rgb(48,48,48));
+                : Color.argb("soft".equals(mode) ? 48 : 82,
+                        Color.red(accentColor()), Color.green(accentColor()),
+                        Color.blue(accentColor()));
         applyPanelStyle(findViewById(R.id.app_root), line);
     }
 
@@ -1489,12 +1741,22 @@ public final class MainActivity extends Activity implements Events.Listener {
         // гребёнку: каждая строка получала рамку со скруглением и превращалась
         // в отдельную карточку, а отклик на нажатие пропадал.
         if (view instanceof LinearLayout && view.getBackground() instanceof GradientDrawable
-                && view.getParent() != messages && view.getId() != R.id.recording_bar) {
+                && !"valanium_top_bar".equals(view.getTag())
+                && view.getParent() != messagesList && view.getId() != R.id.recording_bar
+                && view.getId() != R.id.nav_chats && view.getId() != R.id.nav_settings
+                && view.getId() != R.id.nav_profile) {
             GradientDrawable panel = new GradientDrawable();
-            panel.setColor(themePanel());
+            int base = themePanel();
+            if ("black".equals(themeName())) {
+                panel.setColor(base);
+            } else {
+                panel.setOrientation(GradientDrawable.Orientation.TL_BR);
+                panel.setColors(new int[]{blend(base, accentColor(), .93f), base});
+            }
             panel.setCornerRadius(view.getId() == R.id.composer_row ? dp(999) : dp(cornerRadiusDp()));
             panel.setStroke(dp(1), line);
             view.setBackground(panel);
+            if (view.getId() != R.id.composer_row) view.setElevation(dp(1));
         }
         if (view instanceof android.view.ViewGroup) {
             android.view.ViewGroup group = (android.view.ViewGroup) view;
@@ -1537,13 +1799,24 @@ public final class MainActivity extends Activity implements Events.Listener {
     /** Общая форма пузыря: одна на переписку и на превью в настройках. */
     private GradientDrawable bubbleBackground(boolean outgoing) {
         GradientDrawable background = new GradientDrawable();
-        background.setColor(outgoing ? accentColor() : themeIncomingBubble());
+        if (outgoing) {
+            int accent = accentColor();
+            background.setOrientation(GradientDrawable.Orientation.TL_BR);
+            background.setColors(new int[]{
+                    blend(accent, Color.WHITE, .86f),
+                    blend(accent, themePanel(), .84f),
+            });
+        } else {
+            background.setColor(themeIncomingBubble());
+        }
         background.setCornerRadius(dp(bubbleRadiusDp()));
         if (!outgoing) {
             String dividers = appearancePreferences == null
-                    ? "full" : appearancePreferences.getString("dividers", "full");
+                    ? "soft" : appearancePreferences.getString("dividers", "soft");
             background.setStroke(dp(1), "none".equals(dividers) ? Color.TRANSPARENT
-                    : "light".equals(themeName()) ? Color.rgb(219, 219, 214) : Color.rgb(45, 45, 45));
+                    : Color.argb("soft".equals(dividers) ? 38 : 68,
+                            Color.red(accentColor()), Color.green(accentColor()),
+                            Color.blue(accentColor())));
         }
         return background;
     }
@@ -1555,7 +1828,7 @@ public final class MainActivity extends Activity implements Events.Listener {
         // Оформление сменилось: собранные пузыри устарели целиком. Без сброса
         // новый размер текста и скругления достались бы только новым сообщениям.
         pages.remove(conversation);
-        messages.removeAllViews();
+        messageListAdapter.submit(java.util.Collections.emptyList());
         loadOlder(conversation);
     }
 
@@ -1954,6 +2227,26 @@ public final class MainActivity extends Activity implements Events.Listener {
         Events.subscribe(this);
         startEventDelivery();
         submit(Commands.status());
+        submit(Commands.conversations());
+        if (networkCallback == null) {
+            ConnectivityManager manager = getSystemService(ConnectivityManager.class);
+            if (manager != null) {
+                networkCallback = new ConnectivityManager.NetworkCallback() {
+                    @Override public void onLost(Network network) { networkWasLost = true; }
+                    @Override public void onAvailable(Network network) {
+                        if (!networkWasLost) return;
+                        networkWasLost = false;
+                        ui.post(() -> {
+                            if (!foregroundAuthorized || myDeviceHex.isEmpty()) return;
+                            submit(Commands.disconnect());
+                            connectSelectedRoute();
+                            submit(Commands.conversations());
+                        });
+                    }
+                };
+                manager.registerDefaultNetworkCallback(networkCallback);
+            }
+        }
     }
 
     private void requestNotificationPermission() {
@@ -2037,7 +2330,7 @@ public final class MainActivity extends Activity implements Events.Listener {
         findViewById(R.id.account_reconnect).setOnClickListener(v -> {
             if (myDeviceHex.isEmpty()) return;
             submit(Commands.disconnect());
-            ui.postDelayed(() -> submit(Commands.connect(serverUrl())), 250);
+            ui.postDelayed(this::connectSelectedRoute, 250);
             toast("Переподключаемся…");
         });
         findViewById(R.id.account_updates).setOnClickListener(v -> checkForUpdates(true));
@@ -2108,7 +2401,7 @@ public final class MainActivity extends Activity implements Events.Listener {
     }
 
     private void checkForUpdates(boolean manual) {
-        if ("onion".equals(appearancePreferences.getString(TRANSPORT_KEY, "onion"))
+        if ("onion".equals(appearancePreferences.getString(TRANSPORT_KEY, "auto"))
                 || (myDeviceHex.isEmpty() && ((Switch) findViewById(R.id.entry_tor_only)).isChecked())) {
             if (manual) toast("В режиме только Tor обычные HTTPS-проверки обновлений отключены.");
             return;
@@ -2390,16 +2683,7 @@ public final class MainActivity extends Activity implements Events.Listener {
     private void applyRead(JSONArray ids) {
         if (ids == null) return;
         for (int i = 0; i < ids.length(); i++) readIds.add(ids.optString(i));
-        for (int i = 0; i < messages.getChildCount(); i++) {
-            View child = messages.getChildAt(i);
-            if (child.getTag() instanceof String && readIds.contains(child.getTag())) {
-                TextView delivery = child.findViewWithTag("delivery");
-                if (delivery != null) {
-                    delivery.setText("✓✓");
-                    delivery.setContentDescription("Прочитано");
-                }
-            }
-        }
+        if (messageListAdapter != null) messageListAdapter.notifyDataSetChanged();
     }
 
     private void submit(String command) {
@@ -2453,7 +2737,21 @@ public final class MainActivity extends Activity implements Events.Listener {
                 onConversations(event.optJSONArray("items"));
                 break;
             case "conversation_started":
-                conversations.put(event.optString("peer_device"), event.optString("conversation"));
+                String startedPeer = event.optString("peer_device");
+                String startedConversation = event.optString("conversation");
+                conversations.put(startedPeer, startedConversation);
+                ChatPage pending = pages.remove(pendingPageKey(startedPeer));
+                if (pending != null) {
+                    ChatPage established = pages.get(startedConversation);
+                    if (established == null) {
+                        pages.put(startedConversation, pending);
+                    } else {
+                        established.timeline.addAll(pending.timeline);
+                        normalizeSeparators(established.timeline);
+                        regroupTimeline(established.timeline);
+                    }
+                    if (startedPeer.equals(currentPeer)) paintConversation(startedConversation);
+                }
                 renderPeers();
                 break;
             case "message":
@@ -2558,7 +2856,7 @@ public final class MainActivity extends Activity implements Events.Listener {
         submit(Commands.fingerprint(myIdentityHex));
         submit(Commands.conversations());
         setStatus(getString(R.string.status_connecting));
-        submit(Commands.connect(serverUrl()));
+        connectSelectedRoute();
     }
 
     private void onFailed(JSONObject event) {
@@ -2610,15 +2908,27 @@ public final class MainActivity extends Activity implements Events.Listener {
             }
         }
         renderPeers();
+        if (currentPeer != null && screenConversation.getVisibility() == View.VISIBLE) {
+            refreshHistory(conversations.get(currentPeer));
+        }
+    }
+
+    private void refreshHistory(String conversation) {
+        if (TextUtils.isEmpty(conversation) || !page(conversation).loaded
+                || !refreshRequests.add(conversation)) return;
+        submit(Commands.history(conversation, HISTORY_PAGE, null));
     }
 
     private void onMessage(JSONObject event) {
         String conversation = event.optString("conversation");
         String peer = peerOf(conversation);
         if (peer == null) {
-            peer = event.optString("sender_device");
-            conversations.put(peer, conversation);
-            renderPeers();
+            // У человека с несколькими устройствами sender_device — лишь один
+            // канал нити. Если завести по нему строку, собеседник на мгновение
+            // раздвоится. Ядро уже знает соответствие нити личности: просим
+            // канонический список и берём сообщение из сохранённой истории.
+            submit(Commands.conversations());
+            return;
         }
         String body = event.optString("body");
         JSONObject content = parseContent(body);
@@ -2652,6 +2962,11 @@ public final class MainActivity extends Activity implements Events.Listener {
             return;
         }
 
+        if (refreshRequests.remove(conversation)) {
+            mergeRecentHistory(conversation, items);
+            return;
+        }
+
         ChatPage entry = page(conversation);
         entry.loading = false;
         entry.loaded = true;
@@ -2678,7 +2993,7 @@ public final class MainActivity extends Activity implements Events.Listener {
         }
 
         // Ядро отдаёт новейшие первыми — на экране порядок обратный.
-        List<View> fresh = new ArrayList<>();
+        List<TimelineItem> fresh = new ArrayList<>();
         Set<String> incoming = new HashSet<>();
         String freshDay = null;
         for (int i = items.length() - 1; i >= 0; i--) {
@@ -2690,43 +3005,48 @@ public final class MainActivity extends Activity implements Events.Listener {
             if (timestamp <= 0) timestamp = System.currentTimeMillis();
             String day = dateKey(timestamp);
             if (!day.equals(freshDay)) {
-                fresh.add(dateSeparator(timestamp));
+                fresh.add(TimelineItem.separator(timestamp));
                 freshDay = day;
             }
             boolean outgoing = item.optBoolean("outgoing");
-            View bubble = buildBubble(item.optString("body"), outgoing);
-            if (bubble == null) continue;
-            markTimelineBubble(bubble, outgoing, timestamp);
-            fresh.add(bubble);
-            if (!outgoing && !content.optString("id").isEmpty()) {
-                incoming.add(content.optString("id"));
+            String id = content.optString("id");
+            fresh.add(TimelineItem.message(item.optString("body"), outgoing, timestamp, id));
+            if (!outgoing && !id.isEmpty()) {
+                incoming.add(id);
             }
         }
         // Страница всегда старше того, что уже лежит в кэше.
-        boolean initialPage = entry.bubbles.isEmpty();
-        if (!fresh.isEmpty() && !entry.bubbles.isEmpty()
-                && freshDay != null && freshDay.equals(entry.bubbles.get(0).getTag())) {
-            View duplicate = entry.bubbles.remove(0);
-            if (duplicate.getParent() instanceof ViewGroup) {
-                ((ViewGroup) duplicate.getParent()).removeView(duplicate);
+        boolean initialPage = entry.timeline.isEmpty();
+        int removed = 0;
+        if (!fresh.isEmpty() && !entry.timeline.isEmpty() && freshDay != null) {
+            TimelineItem first = entry.timeline.get(0);
+            if (first.separator && freshDay.equals(dateKey(first.timestamp))) {
+                entry.timeline.remove(0);
+                removed = 1;
             }
         }
-        entry.bubbles.addAll(0, fresh);
-        regroupTimeline(entry.bubbles);
+        entry.timeline.addAll(0, fresh);
+        regroupTimeline(entry.timeline);
 
         // Ответ мог опоздать: пока он шёл, человек успел уйти в другую беседу.
         if (!conversation.equals(conversations.get(currentPeer))) return;
 
         if (initialPage) {
-            entry.scrollY = -1;
+            entry.firstVisible = -1;
             paintConversation(conversation);
         } else {
-            // Догрузка вверх: держим содержимое на месте, а не прыгаем.
-            final int heightBefore = messages.getHeight();
-            final int offset = messagesScroll.getScrollY();
-            for (int i = fresh.size() - 1; i >= 0; i--) messages.addView(fresh.get(i), 0);
-            messages.post(() ->
-                    messagesScroll.scrollTo(0, messages.getHeight() - heightBefore + offset));
+            // Догрузка вверх: якорь остаётся той же строкой, а не тем же пикселем
+            // огромного ScrollView. Это устойчиво при фото разной высоты.
+            final int firstVisible = messagesList.getFirstVisiblePosition();
+            final View anchor = messagesList.getChildAt(0);
+            final int top = anchor == null ? 0 : anchor.getTop();
+            final int delta = Math.max(0, fresh.size() - removed);
+            messagePagingEnabled = false;
+            messageListAdapter.submit(entry.timeline);
+            messagesList.post(() -> {
+                messagesList.setSelectionFromTop(firstVisible + delta, top);
+                messagePagingEnabled = true;
+            });
         }
         sendRead(currentPeer, incoming);
     }
@@ -2767,6 +3087,223 @@ public final class MainActivity extends Activity implements Events.Listener {
 
     // --- отрисовка -------------------------------------------------------------
 
+    /** Подключает системные виртуализированные списки без AndroidX. */
+    private void configureVirtualLists() {
+        chatListAdapter = new VirtualListAdapter<>(new VirtualListAdapter.Renderer<ChatListItem>() {
+            @Override public int viewTypeCount() { return 5; }
+            @Override public int viewType(ChatListItem item, int position) { return item.kind; }
+
+            @Override public View render(ChatListItem item, int position, View recycled,
+                    ViewGroup parent) {
+                switch (item.kind) {
+                    case CHAT_ROW_SEARCH:
+                        return searchHitRow(item.search);
+                    case CHAT_ROW_NOTICE:
+                        return listNotice(item.text);
+                    case CHAT_ROW_EMPTY:
+                        return emptyState(R.drawable.ic_chat, getString(R.string.chats_none_title),
+                                getString(R.string.chats_none_hint));
+                    case CHAT_ROW_ACTION:
+                        Button action = recycled instanceof Button ? (Button) recycled : new Button(MainActivity.this);
+                        action.setText(item.text);
+                        action.setTextSize(15);
+                        action.setAllCaps(false);
+                        action.setMinimumHeight(dp(52));
+                        action.setTextColor(item.action == 1
+                                ? (Color.luminance(accentColor()) > .55 ? Color.BLACK : Color.WHITE)
+                                : themeText());
+                        if (item.action == 1) {
+                            GradientDrawable primary = new GradientDrawable();
+                            primary.setColor(accentColor());
+                            primary.setCornerRadius(dp(16));
+                            action.setBackground(primary);
+                            action.setOnClickListener(v -> {
+                                newPeer.requestFocus();
+                                ((android.view.inputmethod.InputMethodManager) getSystemService(INPUT_METHOD_SERVICE))
+                                        .showSoftInput(newPeer,
+                                                android.view.inputmethod.InputMethodManager.SHOW_IMPLICIT);
+                            });
+                        } else {
+                            action.setBackgroundColor(Color.TRANSPARENT);
+                            action.setOnClickListener(v -> findViewById(R.id.account_share).performClick());
+                        }
+                        return action;
+                    default:
+                        return conversationRow(item.peer, recycled);
+                }
+            }
+        });
+        contactList.setAdapter(chatListAdapter);
+
+        requestListAdapter = new VirtualListAdapter<>(new VirtualListAdapter.Renderer<RequestListItem>() {
+            @Override public int viewTypeCount() { return 2; }
+            @Override public int viewType(RequestListItem item, int position) {
+                return item.device == null ? 1 : 0;
+            }
+
+            @Override public View render(RequestListItem item, int position, View recycled,
+                    ViewGroup parent) {
+                return item.device == null
+                        ? emptyState(R.drawable.ic_shield, getString(R.string.requests_none),
+                                getString(R.string.requests_none_hint))
+                        : requestCard(item.device, item.entry);
+            }
+        });
+        requestList.setAdapter(requestListAdapter);
+
+        messageListAdapter = new VirtualListAdapter<>(new VirtualListAdapter.Renderer<TimelineItem>() {
+            @Override public int viewTypeCount() { return 2; }
+            @Override public int viewType(TimelineItem item, int position) {
+                return item.separator ? 0 : 1;
+            }
+
+            @Override public View render(TimelineItem item, int position, View recycled,
+                    ViewGroup parent) {
+                if (item.separator) return dateSeparator(item.timestamp, recycled);
+                return messageRow(item, recycled);
+            }
+        });
+        messagesList.setAdapter(messageListAdapter);
+    }
+
+    /** ListView переиспользует оболочку строки, сложный пузырь создаётся только для видимой области. */
+    private View messageRow(TimelineItem item, View recycled) {
+        boolean created = !(recycled instanceof FrameLayout);
+        FrameLayout row = created ? new FrameLayout(this) : (FrameLayout) recycled;
+        row.removeAllViews();
+        row.setPadding(0, 0, 0, dp(item.bottomMarginDp));
+        View bubble = buildBubble(item.body, item.outgoing, currentPeer);
+        FrameLayout.LayoutParams params = new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT,
+                item.outgoing ? Gravity.END : Gravity.START);
+        params.leftMargin = item.outgoing ? dp(48) : 0;
+        params.rightMargin = item.outgoing ? 0 : dp(48);
+        bubble.setLayoutParams(params);
+        row.addView(bubble);
+        if (created && motionEnabled()) {
+            row.setAlpha(0f);
+            row.setTranslationY(dp(8));
+            row.post(() -> row.animate().alpha(1f).translationY(0f).setDuration(230)
+                    .setInterpolator(new android.view.animation.DecelerateInterpolator()).start());
+        }
+        return row;
+    }
+
+    private static final class ChatRowHolder {
+        final TextView avatar;
+        final TextView title;
+        final TextView subtitle;
+        final TextView time;
+        final TextView badge;
+
+        ChatRowHolder(TextView avatar, TextView title, TextView subtitle,
+                TextView time, TextView badge) {
+            this.avatar = avatar;
+            this.title = title;
+            this.subtitle = subtitle;
+            this.time = time;
+            this.badge = badge;
+        }
+    }
+
+    /** Переиспользуемая строка диалога: при прокрутке меняются данные, не дерево View. */
+    private View conversationRow(String peer, View recycled) {
+        LinearLayout row;
+        ChatRowHolder holder;
+        boolean created = false;
+        if (recycled instanceof LinearLayout && recycled.getTag() instanceof ChatRowHolder) {
+            row = (LinearLayout) recycled;
+            holder = (ChatRowHolder) recycled.getTag();
+        } else {
+            created = true;
+            row = new LinearLayout(this);
+            row.setOrientation(LinearLayout.HORIZONTAL);
+            row.setGravity(Gravity.CENTER_VERTICAL);
+            row.setPadding(dp(12), dp(10), dp(14), dp(10));
+            row.setBackgroundResource(R.drawable.panel_glass);
+            row.setLayoutParams(new android.widget.AbsListView.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, dp(76)));
+
+            TextView avatar = new TextView(this);
+            avatar.setGravity(Gravity.CENTER);
+            avatar.setTextColor(Color.WHITE);
+            avatar.setTextSize(17);
+            avatar.setLayoutParams(new LinearLayout.LayoutParams(dp(52), dp(52)));
+
+            LinearLayout copy = new LinearLayout(this);
+            copy.setOrientation(LinearLayout.VERTICAL);
+            copy.setPadding(dp(12), 0, 0, 0);
+            copy.setLayoutParams(new LinearLayout.LayoutParams(0,
+                    LinearLayout.LayoutParams.WRAP_CONTENT, 1));
+            TextView title = new TextView(this);
+            title.setTextColor(Color.WHITE);
+            title.setTextSize(16);
+            title.setMaxLines(1);
+            title.setEllipsize(TextUtils.TruncateAt.END);
+            TextView subtitle = new TextView(this);
+            subtitle.setTextColor(getColor(R.color.valanium_muted));
+            subtitle.setTextSize(12);
+            subtitle.setMaxLines(1);
+            subtitle.setEllipsize(TextUtils.TruncateAt.END);
+            copy.addView(title);
+            copy.addView(subtitle);
+
+            LinearLayout meta = new LinearLayout(this);
+            meta.setOrientation(LinearLayout.VERTICAL);
+            meta.setGravity(Gravity.END);
+            TextView time = new TextView(this);
+            time.setTextColor(getColor(R.color.valanium_dim));
+            time.setTextSize(11);
+            time.setGravity(Gravity.END);
+            TextView badge = new TextView(this);
+            badge.setTextColor(Color.rgb(5, 5, 5));
+            badge.setTextSize(11);
+            badge.setGravity(Gravity.CENTER);
+            LinearLayout.LayoutParams badgeParams = new LinearLayout.LayoutParams(dp(24), dp(22));
+            badgeParams.topMargin = dp(7);
+            badgeParams.gravity = Gravity.END;
+            badge.setLayoutParams(badgeParams);
+            meta.addView(time);
+            meta.addView(badge);
+
+            row.addView(avatar);
+            row.addView(copy);
+            row.addView(meta);
+            holder = new ChatRowHolder(avatar, title, subtitle, time, badge);
+            row.setTag(holder);
+        }
+
+        Profile profile = profiles.get(peer);
+        ConversationPreview preview = previews.get(peer);
+        applyAvatar(holder.avatar, profile, initials(displayName(peer)));
+        holder.title.setText(nameWithEmblem(peer));
+        holder.title.setTextColor(themeText());
+        holder.subtitle.setText(previewText(preview));
+        holder.time.setText(previewTime(preview));
+        if (preview != null && preview.unread > 0) {
+            holder.badge.setVisibility(View.VISIBLE);
+            holder.badge.setText(preview.unread > 99 ? "99+" : String.valueOf(preview.unread));
+            GradientDrawable dot = new GradientDrawable();
+            dot.setColor(accentColor());
+            dot.setCornerRadius(dp(99));
+            holder.badge.setBackground(dot);
+            ViewGroup.LayoutParams raw = holder.badge.getLayoutParams();
+            raw.width = Math.max(dp(24), dp(12 + holder.badge.getText().length() * 6));
+            holder.badge.setLayoutParams(raw);
+        } else {
+            holder.badge.setVisibility(View.GONE);
+        }
+        row.setOnClickListener(v -> selectPeer(peer));
+        installPressFeedback(row);
+        if (created && motionEnabled()) {
+            row.setAlpha(0f);
+            row.setTranslationY(dp(10));
+            row.post(() -> row.animate().alpha(1f).translationY(0f).setDuration(260)
+                    .setInterpolator(new android.view.animation.DecelerateInterpolator()).start());
+        }
+        return row;
+    }
+
     /**
      * Переключение экранов с проявлением.
      *
@@ -2781,9 +3318,89 @@ public final class MainActivity extends Activity implements Events.Listener {
      * «назад» с любой вкладки закрывает приложение, а не гоняет по кругу.
      */
     private void switchTab(View screen) {
+        getWindow().getDecorView().performHapticFeedback(
+                android.view.HapticFeedbackConstants.CLOCK_TICK);
+        if (screen == currentScreen) {
+            scrollScreenToTop(screen);
+            return;
+        }
+
         history.clear();
         navDirection = screen == screenChat ? -1 : 1;
         show(screen);
+    }
+
+    private void mergeRecentHistory(String conversation, JSONArray items) {
+        if (items == null) return;
+        ChatPage entry = page(conversation);
+        Set<String> known = new HashSet<>();
+        for (TimelineItem old : entry.timeline) {
+            if (!old.separator) known.add(TextUtils.isEmpty(old.id)
+                    ? old.body + "@" + old.timestamp : old.id);
+        }
+        Set<String> incoming = new HashSet<>();
+        boolean changed = false;
+        for (int i = items.length() - 1; i >= 0; i--) {
+            JSONObject item = items.optJSONObject(i);
+            if (item == null) continue;
+            String body = item.optString("body");
+            JSONObject content = parseContent(body);
+            if ("read".equals(content.optString("type"))) {
+                applyRead(content.optJSONArray("ids"));
+                continue;
+            }
+            String id = content.optString("id");
+            long timestamp = normalizeTimestamp(item.optLong("created_at"));
+            String key = TextUtils.isEmpty(id) ? body + "@" + timestamp : id;
+            if (!known.add(key)) continue;
+            boolean outgoing = item.optBoolean("outgoing");
+            entry.timeline.add(TimelineItem.message(body, outgoing, timestamp, id));
+            if (!outgoing && !id.isEmpty()) incoming.add(id);
+            changed = true;
+        }
+        if (!changed) return;
+        entry.timeline.removeIf(item -> item.separator);
+        entry.timeline.sort((a, b) -> Long.compare(a.timestamp, b.timestamp));
+        String day = null;
+        for (int i = 0; i < entry.timeline.size(); i++) {
+            TimelineItem item = entry.timeline.get(i);
+            String next = dateKey(item.timestamp);
+            if (!next.equals(day)) {
+                entry.timeline.add(i++, TimelineItem.separator(item.timestamp));
+                day = next;
+            }
+        }
+        regroupTimeline(entry.timeline);
+        if (conversation.equals(conversations.get(currentPeer))
+                && screenConversation.getVisibility() == View.VISIBLE) {
+            boolean atLatest = messagesList.getLastVisiblePosition()
+                    >= messageListAdapter.getCount() - 2;
+            messageListAdapter.submit(entry.timeline);
+            if (atLatest) messagesList.post(() -> scrollToLatest(false));
+            sendRead(currentPeer, incoming);
+        }
+    }
+
+    /** Повторное нажатие активной вкладки возвращает её к началу. */
+    private boolean scrollScreenToTop(View view) {
+        if (view == null || view.getVisibility() != View.VISIBLE) return false;
+        if (view instanceof ScrollView) {
+            ScrollView scroll = (ScrollView) view;
+            if (motionEnabled()) scroll.smoothScrollTo(0, 0); else scroll.scrollTo(0, 0);
+            return true;
+        }
+        if (view instanceof android.widget.AbsListView) {
+            android.widget.AbsListView list = (android.widget.AbsListView) view;
+            if (motionEnabled()) list.smoothScrollToPosition(0); else list.setSelection(0);
+            return true;
+        }
+        if (view instanceof ViewGroup) {
+            ViewGroup group = (ViewGroup) view;
+            for (int i = 0; i < group.getChildCount(); i++) {
+                if (scrollScreenToTop(group.getChildAt(i))) return true;
+            }
+        }
+        return false;
     }
 
     /**
@@ -2804,19 +3421,46 @@ public final class MainActivity extends Activity implements Events.Listener {
             accent = Color.rgb((Color.red(accent) + 255) / 2,
                     (Color.green(accent) + 255) / 2, (Color.blue(accent) + 255) / 2);
         }
+        int selectedNavigation = screen == screenChat ? R.id.nav_chats
+                : screen == screenSettings ? R.id.nav_settings : R.id.nav_profile;
+        boolean selectionChanged = selectedNavigation != activeNavigation;
         for (int[] tab : new int[][]{
                 {R.id.nav_chats, R.id.nav_chats_icon, R.id.nav_chats_label},
                 {R.id.nav_settings, R.id.nav_settings_icon, R.id.nav_settings_label},
                 {R.id.nav_profile, R.id.nav_profile_icon, R.id.nav_profile_label},
         }) {
-            boolean active = (tab[0] == R.id.nav_chats && screen == screenChat)
-                    || (tab[0] == R.id.nav_settings && screen == screenSettings)
-                    || (tab[0] == R.id.nav_profile && screen == screenProfile);
-            ((ImageView) findViewById(tab[1])).setImageTintList(
+            boolean active = tab[0] == selectedNavigation;
+            View item = findViewById(tab[0]);
+            item.setBackground(active ? selectionBackground() : null);
+            ImageView icon = findViewById(tab[1]);
+            icon.setImageTintList(
                     ColorStateList.valueOf(active ? accent : getColor(R.color.valanium_muted)));
             ((TextView) findViewById(tab[2])).setTextColor(
                     active ? accent : getColor(R.color.valanium_muted));
+            if (active && selectionChanged) animateNavigationIcon(icon, tab[0]);
         }
+        activeNavigation = selectedNavigation;
+    }
+
+    /** Короткий живой жест выбранной иконки — без бесконечных декоративных циклов. */
+    private void animateNavigationIcon(ImageView icon, int navigation) {
+        icon.animate().cancel();
+        icon.setAlpha(1f);
+        icon.setScaleX(1f);
+        icon.setScaleY(1f);
+        icon.setTranslationY(0f);
+        icon.setRotation(0f);
+        if (!motionEnabled()) return;
+        icon.setAlpha(.62f);
+        icon.setScaleX(.72f);
+        icon.setScaleY(.72f);
+        icon.setTranslationY(dp(5));
+        icon.setRotation(navigation == R.id.nav_settings ? -32f
+                : navigation == R.id.nav_chats ? -10f : 8f);
+        icon.animate().alpha(1f).scaleX(1f).scaleY(1f).translationY(0f).rotation(0f)
+                .setDuration(360)
+                .setInterpolator(new android.view.animation.OvershootInterpolator(1.8f))
+                .start();
     }
 
     /** Уходит вглубь, запоминая, откуда пришли. */
@@ -2841,6 +3485,7 @@ public final class MainActivity extends Activity implements Events.Listener {
 
     private void show(View screen) {
         currentScreen = screen;
+        updateSystemTopSurface();
         if (tabBar != null) updateTabBar(screen);
         // Следующий переход снова считается движением вглубь, пока не сказано
         // иначе: «назад» выставляет знак сам.
@@ -2851,6 +3496,13 @@ public final class MainActivity extends Activity implements Events.Listener {
                 || screen == screenMigrate) {
             history.clear();
         }
+        // На корневых вкладках стрелка не ведёт никуда и только утяжеляет шапку.
+        // В профиле, открытом из настроек, она снова появляется.
+        View settingsBack = findViewById(R.id.settings_back);
+        if (settingsBack != null) settingsBack.setVisibility(View.INVISIBLE);
+        View profileBack = findViewById(R.id.profile_back);
+        if (profileBack != null) profileBack.setVisibility(
+                screen == screenProfile && !history.isEmpty() ? View.VISIBLE : View.INVISIBLE);
         for (View candidate : new View[]{screenBoot, screenMigrate, screenEntry, screenRecover,
                 screenChat, screenConversation, screenProfile, screenSettings, screenPrivacy,
                 screenPrivacySection, screenAppearance, screenConnection, screenProtection, screenUsername, screenSecurity,
@@ -2864,18 +3516,80 @@ public final class MainActivity extends Activity implements Events.Listener {
             boolean alreadyShown = candidate.getVisibility() == View.VISIBLE;
             candidate.setVisibility(View.VISIBLE);
             if (alreadyShown) continue;
+            // Полноширинная шапка теперь является продолжением status bar и
+            // не должна ездить вместе со страницей. Двигается только контент
+            // под ней — меньше работы для GPU и нет отстающих краёв.
+            if (containsTopBar(candidate)) {
+                candidate.animate().cancel();
+                candidate.setAlpha(1f);
+                candidate.setTranslationX(0f);
+                candidate.setTranslationY(0f);
+                animateBelowTopBar(candidate, enter, motionEnabled());
+                if (motionEnabled()) animateScreenSignature(screen);
+                continue;
+            }
+            if (!motionEnabled()) {
+                candidate.setAlpha(1f);
+                candidate.setTranslationX(0f);
+                candidate.setTranslationY(0f);
+                continue;
+            }
+            animateScreenSignature(screen);
             // Начинаем не с нуля: уходящий экран прячется сразу, и при полной
             // прозрачности входящего между ними мелькает пустота.
             candidate.setAlpha(0.35f);
-            candidate.setTranslationY(0f);
-            candidate.setTranslationX(enter * dp(22));
+            candidate.setTranslationY(dp(6));
+            candidate.setTranslationX(enter * dp(18));
             candidate.animate()
                     .alpha(1f)
                     .translationX(0f)
-                    .setDuration(220)
-                    .setInterpolator(new android.view.animation.DecelerateInterpolator(1.6f))
+                    .translationY(0f)
+                    .setDuration(260)
+                    .setInterpolator(new android.view.animation.DecelerateInterpolator(1.8f))
                     .start();
         }
+    }
+
+    /** Короткий переход содержимого при неподвижной системной шапке. */
+    private void animateBelowTopBar(View screen, int direction, boolean animate) {
+        View topBar = findTopBar(screen);
+        if (topBar == null || !(topBar.getParent() instanceof ViewGroup)) return;
+        ViewGroup host = (ViewGroup) topBar.getParent();
+        int topBarIndex = host.indexOfChild(topBar);
+        for (int i = topBarIndex + 1; i < host.getChildCount(); i++) {
+            View content = host.getChildAt(i);
+            content.animate().cancel();
+            content.setAlpha(1f);
+            content.setTranslationX(0f);
+            content.setTranslationY(0f);
+            if (!animate || content.getVisibility() != View.VISIBLE) continue;
+            content.setAlpha(.72f);
+            content.setTranslationX(direction * dp(8));
+            content.setTranslationY(dp(3));
+            content.animate()
+                    .alpha(1f)
+                    .translationX(0f)
+                    .translationY(0f)
+                    .setDuration(190)
+                    .setInterpolator(new android.view.animation.DecelerateInterpolator(1.8f))
+                    .start();
+        }
+    }
+
+    /** Один мягкий акцент на входе: бренд или аватар, а не весь экран сразу. */
+    private void animateScreenSignature(View screen) {
+        View signature = screen == screenProfile ? profileAvatar
+                : screen == screenEntry ? findViewById(R.id.entry_logo) : null;
+        if (signature == null) return;
+        signature.animate().cancel();
+        signature.setAlpha(.55f);
+        signature.setScaleX(.78f);
+        signature.setScaleY(.78f);
+        signature.setRotation(-7f);
+        signature.animate().alpha(1f).scaleX(1f).scaleY(1f).rotation(0f)
+                .setDuration(420)
+                .setInterpolator(new android.view.animation.OvershootInterpolator(1.3f))
+                .start();
     }
 
     /**
@@ -2888,14 +3602,22 @@ public final class MainActivity extends Activity implements Events.Listener {
      * applyAccent).
      */
     private void installPressFeedback(View view) {
-        if (view instanceof Button || view instanceof android.widget.ImageButton) {
+        boolean textInput = view instanceof EditText || view instanceof Switch
+                || view instanceof SeekBar;
+        if (!textInput && (view instanceof Button || view instanceof android.widget.ImageButton
+                || view.isClickable())) {
             view.setOnTouchListener((target, event) -> {
+                if (!motionEnabled()) return false;
                 int action = event.getActionMasked();
                 if (action == android.view.MotionEvent.ACTION_DOWN) {
-                    target.animate().scaleX(.96f).scaleY(.96f).setDuration(90).start();
+                    target.animate().scaleX(.975f).scaleY(.975f).alpha(.86f)
+                            .setDuration(80).start();
                 } else if (action == android.view.MotionEvent.ACTION_UP
                         || action == android.view.MotionEvent.ACTION_CANCEL) {
-                    target.animate().scaleX(1f).scaleY(1f).setDuration(130).start();
+                    target.animate().scaleX(1f).scaleY(1f).alpha(1f)
+                            .setDuration(150)
+                            .setInterpolator(new android.view.animation.OvershootInterpolator(1.2f))
+                            .start();
                 }
                 return false; // клик обрабатывает обычный OnClickListener
             });
@@ -2904,6 +3626,11 @@ public final class MainActivity extends Activity implements Events.Listener {
             android.view.ViewGroup group = (android.view.ViewGroup) view;
             for (int i = 0; i < group.getChildCount(); i++) installPressFeedback(group.getChildAt(i));
         }
+    }
+
+    private boolean motionEnabled() {
+        return Build.VERSION.SDK_INT < Build.VERSION_CODES.O
+                || android.animation.ValueAnimator.areAnimatorsEnabled();
     }
 
     private void showFatal(String message) {
@@ -2923,10 +3650,7 @@ public final class MainActivity extends Activity implements Events.Listener {
 
     private void copyDevice() {
         if (myDeviceHex.isEmpty()) return;
-        android.content.ClipboardManager clipboard =
-                (android.content.ClipboardManager) getSystemService(CLIPBOARD_SERVICE);
-        clipboard.setPrimaryClip(android.content.ClipData.newPlainText("Valanium device", myDeviceHex));
-        toast(getString(R.string.device_copied));
+        copyToClipboard(myDeviceHex, getString(R.string.device_copied));
     }
 
     /** Переписки, подходящие под строку поиска. */
@@ -2994,18 +3718,28 @@ public final class MainActivity extends Activity implements Events.Listener {
                 LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
         bodyParams.topMargin = dp(7);
         card.addView(body, bodyParams);
+        if (motionEnabled()) {
+            card.setAlpha(0f);
+            card.setTranslationY(dp(12));
+            icon.setScaleX(.7f);
+            icon.setScaleY(.7f);
+            icon.setRotation(-8f);
+            card.post(() -> {
+                card.animate().alpha(1f).translationY(0f).setDuration(280).start();
+                icon.animate().scaleX(1f).scaleY(1f).rotation(0f).setDuration(360)
+                        .setInterpolator(new android.view.animation.OvershootInterpolator(1.6f))
+                        .start();
+            });
+        }
         return card;
     }
 
     private void copyChatCode() {
         if (ownChatCode.isEmpty()) {
-            toast(getString(R.string.chat_code_waiting));
+            toast(getString(R.string.chat_code_unavailable));
             return;
         }
-        android.content.ClipboardManager clipboard =
-                (android.content.ClipboardManager) getSystemService(CLIPBOARD_SERVICE);
-        clipboard.setPrimaryClip(android.content.ClipData.newPlainText("Valanium chat code", ownChatCode));
-        toast("Код для чата скопирован");
+        copyToClipboard(ownChatCode, getString(R.string.chat_code_copied));
     }
 
     /**
@@ -3025,7 +3759,7 @@ public final class MainActivity extends Activity implements Events.Listener {
                         : Color.rgb(224, 178, 92);
         dot.setBackgroundTintList(ColorStateList.valueOf(color));
         status.setContentDescription(text);
-        ((TextView) findViewById(R.id.status_text)).setText(text);
+        ((TextView) findViewById(R.id.status_text)).setText(compactStatus(text));
         renderConnectionOverview();
         // Смена состояния коротко подсвечивается: иначе точку легко не заметить.
         dot.animate().cancel();
@@ -3036,124 +3770,55 @@ public final class MainActivity extends Activity implements Events.Listener {
                 .start();
     }
 
+    /** Полная причина остаётся по нажатию и для TalkBack, в шапке — короткое состояние. */
+    private String compactStatus(String text) {
+        if (getString(R.string.status_online).equals(text)) return text;
+        if (getString(R.string.status_reconnecting).equals(text)) {
+            return getString(R.string.status_short_reconnecting);
+        }
+        if (getString(R.string.transport_switching).equals(text)) {
+            return getString(R.string.status_short_route);
+        }
+        if (text != null && text.toLowerCase(Locale.ROOT).contains("tor")) {
+            return getString(R.string.status_short_tor);
+        }
+        return getString(R.string.status_short_connecting);
+    }
+
     private void renderPeers() {
-        contactList.removeAllViews();
-        if (lookupHit != null) contactList.addView(searchHitRow(lookupHit));
+        List<ChatListItem> rows = new ArrayList<>();
+        if (lookupHit != null) rows.add(ChatListItem.search(lookupHit));
         if (!listFilter.isEmpty() && matchingPeers().isEmpty()) {
             if (lookupHit == null) {
-                contactList.addView(listNotice(lookupMissed
+                rows.add(ChatListItem.notice(lookupMissed
                         ? getString(R.string.search_miss) : getString(R.string.nothing_found)));
             }
+            chatListAdapter.submit(rows);
             return;
         }
         if (conversations.isEmpty()) {
-            contactList.addView(emptyState(R.drawable.ic_chat,
-                    getString(R.string.chats_none_title), getString(R.string.chats_none_hint)));
-            Button start = new Button(this);
-            start.setText("Начать чат");
-            start.setTextSize(15);
-            start.setAllCaps(false);
-            start.setTextColor(Color.luminance(accentColor()) > .55 ? Color.BLACK : Color.WHITE);
-            GradientDrawable primary = new GradientDrawable();
-            primary.setColor(accentColor());
-            primary.setCornerRadius(dp(16));
-            start.setBackground(primary);
-            contactList.addView(start, new LinearLayout.LayoutParams(-1, dp(52)));
-            start.setOnClickListener(v -> {
-                newPeer.requestFocus();
-                ((android.view.inputmethod.InputMethodManager) getSystemService(INPUT_METHOD_SERVICE))
-                        .showSoftInput(newPeer, android.view.inputmethod.InputMethodManager.SHOW_IMPLICIT);
-            });
-            Button share = new Button(this);
-            share.setText("Поделиться моим кодом");
-            share.setTextSize(15);
-            share.setAllCaps(false);
-            share.setTextColor(themeText());
-            share.setBackgroundColor(Color.TRANSPARENT);
-            contactList.addView(share, new LinearLayout.LayoutParams(-1, dp(52)));
-            share.setOnClickListener(v -> findViewById(R.id.account_share).performClick());
+            rows.add(ChatListItem.empty());
+            rows.add(ChatListItem.action("Начать чат", 1));
+            rows.add(ChatListItem.action("Поделиться моим кодом", 2));
+            chatListAdapter.submit(rows);
             return;
         }
         for (String peer : matchingPeers()) {
-            Profile profile = profiles.get(peer);
-            LinearLayout row = new LinearLayout(this);
-            row.setOrientation(LinearLayout.HORIZONTAL);
-            row.setGravity(Gravity.CENTER_VERTICAL);
-            row.setPadding(dp(12), dp(10), dp(14), dp(10));
-            row.setBackgroundResource(R.drawable.panel_glass);
-            LinearLayout.LayoutParams rowParams = new LinearLayout.LayoutParams(
-                    LinearLayout.LayoutParams.MATCH_PARENT, dp(76));
-            rowParams.bottomMargin = dp(8);
-            row.setLayoutParams(rowParams);
-
-            TextView avatar = new TextView(this);
-            avatar.setGravity(Gravity.CENTER);
-            avatar.setTextColor(Color.WHITE);
-            avatar.setTextSize(17);
-            avatar.setLayoutParams(new LinearLayout.LayoutParams(dp(52), dp(52)));
-            applyAvatar(avatar, profile, initials(displayName(peer)));
-
-            LinearLayout copy = new LinearLayout(this);
-            copy.setOrientation(LinearLayout.VERTICAL);
-            copy.setPadding(dp(12), 0, 0, 0);
-            copy.setLayoutParams(new LinearLayout.LayoutParams(0,
-                    LinearLayout.LayoutParams.WRAP_CONTENT, 1));
-            TextView title = new TextView(this);
-            title.setText(nameWithEmblem(peer));
-            title.setTextColor(Color.WHITE);
-            title.setTextSize(16);
-            title.setMaxLines(1);
-            title.setEllipsize(TextUtils.TruncateAt.END);
-            TextView subtitle = new TextView(this);
-            ConversationPreview preview = previews.get(peer);
-            subtitle.setText(previewText(preview));
-            subtitle.setTextColor(getColor(R.color.valanium_muted));
-            subtitle.setTextSize(12);
-            subtitle.setMaxLines(1);
-            subtitle.setEllipsize(TextUtils.TruncateAt.END);
-            copy.addView(title);
-            copy.addView(subtitle);
-            row.addView(avatar);
-            row.addView(copy);
-
-            LinearLayout meta = new LinearLayout(this);
-            meta.setOrientation(LinearLayout.VERTICAL);
-            meta.setGravity(Gravity.END);
-            TextView time = new TextView(this);
-            time.setText(previewTime(preview));
-            time.setTextColor(getColor(R.color.valanium_dim));
-            time.setTextSize(10);
-            time.setGravity(Gravity.END);
-            meta.addView(time);
-            if (preview != null && preview.unread > 0) {
-                TextView badge = new TextView(this);
-                badge.setText(preview.unread > 99 ? "99+" : String.valueOf(preview.unread));
-                badge.setTextColor(Color.rgb(5, 5, 5));
-                badge.setTextSize(10);
-                badge.setGravity(Gravity.CENTER);
-                GradientDrawable dot = new GradientDrawable();
-                dot.setColor(accentColor());
-                dot.setCornerRadius(dp(99));
-                badge.setBackground(dot);
-                LinearLayout.LayoutParams badgeParams = new LinearLayout.LayoutParams(
-                        Math.max(dp(22), dp(12 + badge.getText().length() * 6)), dp(22));
-                badgeParams.topMargin = dp(7);
-                badgeParams.gravity = Gravity.END;
-                badge.setLayoutParams(badgeParams);
-                meta.addView(badge);
-            }
-            row.addView(meta);
-            row.setOnClickListener(v -> selectPeer(peer));
-            contactList.addView(row);
+            rows.add(ChatListItem.peer(peer));
         }
+        chatListAdapter.submit(rows);
     }
 
     private void selectPeer(String peer) {
         // Позицию покидаемой беседы запоминаем: вернуться в середину переписки
         // и оказаться внизу — это потерянное место чтения.
         String leaving = conversations.get(currentPeer);
+        if (TextUtils.isEmpty(leaving) && currentPeer != null) leaving = pendingPageKey(currentPeer);
         if (leaving != null && pages.containsKey(leaving)) {
-            pages.get(leaving).scrollY = messagesScroll.getScrollY();
+            ChatPage previous = pages.get(leaving);
+            previous.firstVisible = messagesList.getFirstVisiblePosition();
+            View anchor = messagesList.getChildAt(0);
+            previous.topOffset = anchor == null ? 0 : anchor.getTop();
         }
 
         currentPeer = peer;
@@ -3164,32 +3829,51 @@ public final class MainActivity extends Activity implements Events.Listener {
 
         String conversation = conversations.get(peer);
         if (TextUtils.isEmpty(conversation)) {
-            messages.removeAllViews();
+            ChatPage pending = pages.get(pendingPageKey(peer));
+            if (pending == null) {
+                messagePagingEnabled = false;
+                messageListAdapter.submit(java.util.Collections.emptyList());
+            } else {
+                paintConversation(pendingPageKey(peer));
+            }
         } else {
             ChatPage entry = page(conversation);
             // Уже открывали — показываем мгновенно и в базу не ходим.
             paintConversation(conversation);
             if (!entry.loaded) loadOlder(conversation);
+            else refreshHistory(conversation);
         }
         if (profilesSupported && !profiles.containsKey(peer)) submit(Commands.profileGet(peer));
     }
 
-    /** Рисует кэш беседы целиком. Пузыри переиспользуются, поэтому это дёшево. */
+    /** Передаёт модели открытой беседы виртуальному списку. */
     private void paintConversation(String conversation) {
         ChatPage entry = page(conversation);
-        messages.removeAllViews();
-        for (View bubble : entry.bubbles) {
-            // Узел мог остаться прикреплённым к прошлой раскладке.
-            if (bubble.getParent() instanceof ViewGroup) {
-                ((ViewGroup) bubble.getParent()).removeView(bubble);
-            }
-            messages.addView(bubble);
-        }
-        if (entry.scrollY < 0) {
-            messagesScroll.post(() -> messagesScroll.fullScroll(View.FOCUS_DOWN));
+        messagePagingEnabled = false;
+        messageListAdapter.submit(entry.timeline);
+        if (entry.firstVisible < 0) {
+            messagesList.post(() -> {
+                scrollToLatest(false);
+                messagePagingEnabled = true;
+                fillMessageViewportIfNeeded(conversation);
+            });
         } else {
-            final int target = entry.scrollY;
-            messagesScroll.post(() -> messagesScroll.scrollTo(0, target));
+            final int target = entry.firstVisible;
+            final int offset = entry.topOffset;
+            messagesList.post(() -> {
+                messagesList.setSelectionFromTop(target, offset);
+                messagePagingEnabled = true;
+            });
+        }
+    }
+
+    /** Короткая первая страница не должна оставлять сверху пустой экран. */
+    private void fillMessageViewportIfNeeded(String conversation) {
+        if (conversation.startsWith("pending:")) return;
+        ChatPage entry = page(conversation);
+        if (!entry.hasMore || entry.loading) return;
+        if (messageListAdapter.getCount() <= messagesList.getChildCount() + 1) {
+            loadOlder(conversation);
         }
     }
 
@@ -3270,11 +3954,8 @@ public final class MainActivity extends Activity implements Events.Listener {
         return avatarPlaceholder(tint, "OB");
     }
 
-    private void updateScrollToBottom(int scrollY) {
-        View content = messagesScroll.getChildAt(0);
-        if (content == null) return;
-        int remaining = content.getHeight() - messagesScroll.getHeight() - scrollY;
-        boolean show = remaining > dp(120);
+    private void updateScrollToBottom(int firstVisible, int visibleCount, int totalCount) {
+        boolean show = totalCount > 0 && firstVisible + visibleCount < totalCount - 1;
         if (show == (scrollToBottom.getVisibility() == View.VISIBLE)) return;
         if (show) {
             scrollToBottom.setVisibility(View.VISIBLE);
@@ -3288,11 +3969,10 @@ public final class MainActivity extends Activity implements Events.Listener {
     }
 
     private void scrollToLatest(boolean smooth) {
-        View content = messagesScroll.getChildAt(0);
-        if (content == null) return;
-        int bottom = Math.max(0, content.getHeight() - messagesScroll.getHeight());
-        if (smooth) messagesScroll.smoothScrollTo(0, bottom);
-        else messagesScroll.scrollTo(0, bottom);
+        int last = messageListAdapter == null ? -1 : messageListAdapter.getCount() - 1;
+        if (last < 0) return;
+        if (smooth) messagesList.smoothScrollToPosition(last);
+        else messagesList.setSelection(last);
         scrollToBottom.setVisibility(View.GONE);
     }
 
@@ -3348,38 +4028,34 @@ public final class MainActivity extends Activity implements Events.Listener {
     }
 
     private void addBubble(String body, boolean outgoing, long timestamp) {
-        View bubble = buildBubble(body, outgoing);
-        if (bubble == null) return;
-        long time = timestamp > 0 ? timestamp : System.currentTimeMillis();
-        markTimelineBubble(bubble, outgoing, time);
-        String conversation = conversations.get(currentPeer);
-        if (conversation != null) {
-            ChatPage entry = page(conversation);
-            View separator = separatorForAppend(entry.bubbles, time);
-            if (separator != null) {
-                entry.bubbles.add(separator);
-                messages.addView(separator);
-            }
-            entry.bubbles.add(bubble);
-            entry.loaded = true;
-            regroupTimeline(entry.bubbles);
+        JSONObject content = parseContent(body);
+        if ("read".equals(content.optString("type"))) {
+            applyRead(content.optJSONArray("ids"));
+            return;
         }
-        messages.addView(bubble);
-        // Сообщение приезжает с той стороны, где стоит его пузырь: своё справа,
-        // чужое слева. Так видно, кто написал, ещё до того как прочитан текст.
-        bubble.setAlpha(0f);
-        bubble.setTranslationY(dp(8));
-        bubble.setTranslationX(outgoing ? dp(14) : -dp(14));
-        bubble.animate()
-                .alpha(1f)
-                .translationY(0f)
-                .translationX(0f)
-                .setDuration(210)
-                .setInterpolator(new android.view.animation.DecelerateInterpolator(1.6f))
-                .start();
-        messagesScroll.post(() -> messagesScroll.fullScroll(View.FOCUS_DOWN));
+        long time = timestamp > 0 ? timestamp : System.currentTimeMillis();
+        String conversation = conversations.get(currentPeer);
+        if (currentPeer != null) {
+            String pageKey = TextUtils.isEmpty(conversation)
+                    ? pendingPageKey(currentPeer) : conversation;
+            ChatPage entry = page(pageKey);
+            TimelineItem separator = separatorForAppend(entry.timeline, time);
+            if (separator != null) {
+                entry.timeline.add(separator);
+            }
+            entry.timeline.add(TimelineItem.message(body, outgoing, time,
+                    content.optString("id")));
+            entry.loaded = true;
+            regroupTimeline(entry.timeline);
+            messagePagingEnabled = false;
+            messageListAdapter.submit(entry.timeline);
+        }
+        messagesList.post(() -> {
+            scrollToLatest(true);
+            messagePagingEnabled = true;
+        });
         if (outgoing && currentPeer != null) {
-            updatePreview(currentPeer, body, true, System.currentTimeMillis(), false);
+            updatePreview(currentPeer, body, true, time, false);
         }
     }
 
@@ -3426,8 +4102,11 @@ public final class MainActivity extends Activity implements Events.Listener {
             bubble.addView(voiceRow(content, outgoing, maxWidth));
         } else if ("image".equals(content.optString("type"))) {
             try {
-                byte[] bytes = Base64.decode(content.optString("data"), Base64.NO_WRAP);
-                Bitmap bitmap = BitmapFactory.decodeByteArray(bytes, 0, bytes.length);
+                String encoded = content.optString("data");
+                String imageKey = content.optString("id");
+                if (imageKey.isEmpty()) imageKey = Integer.toHexString(encoded.hashCode());
+                Bitmap bitmap = messageThumbnail(imageKey, encoded);
+                if (bitmap == null) throw new IllegalArgumentException("bad image");
                 ImageView image = new ImageView(this);
                 image.setAdjustViewBounds(true);
                 image.setScaleType(ImageView.ScaleType.CENTER_CROP);
@@ -3443,7 +4122,15 @@ public final class MainActivity extends Activity implements Events.Listener {
                 image.setContentDescription("Открыть изображение");
                 image.setFocusable(true);
                 image.setTag(R.id.message_image_tag, bitmap);
-                image.setOnClickListener(v -> new PhotoViewer(this, bitmap).show());
+                image.setOnClickListener(v -> {
+                    try {
+                        byte[] fullBytes = Base64.decode(encoded, Base64.NO_WRAP);
+                        Bitmap full = BitmapFactory.decodeByteArray(fullBytes, 0, fullBytes.length);
+                        new PhotoViewer(this, full == null ? bitmap : full).show();
+                    } catch (RuntimeException error) {
+                        new PhotoViewer(this, bitmap).show();
+                    }
+                });
                 bubble.addView(image);
             } catch (RuntimeException ignored) {
                 TextView failed = new TextView(this); failed.setText("Не удалось открыть фото"); failed.setTextColor(Color.GRAY); bubble.addView(failed);
@@ -3501,13 +4188,68 @@ public final class MainActivity extends Activity implements Events.Listener {
 
         String logical = content.optString("id");
         if (!logical.isEmpty()) {
-            // Долгое нажатие — мобильный аналог правой кнопки.
-            bubble.setOnLongClickListener(v -> {
-                showMessageMenu(logical, content.optString("text", ""), outgoing);
-                return true;
+            final String messageText = content.optString("text", "");
+            final float[] start = new float[2];
+            final boolean[] swiping = {false};
+            bubble.setOnTouchListener((view, event) -> {
+                switch (event.getActionMasked()) {
+                    case MotionEvent.ACTION_DOWN:
+                        start[0] = event.getX(); start[1] = event.getY();
+                        swiping[0] = false;
+                        return true;
+                    case MotionEvent.ACTION_MOVE:
+                        float dx = event.getX() - start[0];
+                        float dy = event.getY() - start[1];
+                        if (!swiping[0] && Math.abs(dy) > dp(10) && Math.abs(dy) > Math.abs(dx)) {
+                            return false;
+                        }
+                        if (Math.abs(dx) > dp(12) && Math.abs(dx) > Math.abs(dy)) {
+                            swiping[0] = true;
+                            view.getParent().requestDisallowInterceptTouchEvent(true);
+                            view.setTranslationX(Math.max(-dp(64), Math.min(dp(64), dx)));
+                        }
+                        return true;
+                    case MotionEvent.ACTION_UP:
+                        float distance = event.getX() - start[0];
+                        view.animate().translationX(0).setDuration(150).start();
+                        if (swiping[0] && Math.abs(distance) >= dp(48)) {
+                            view.performHapticFeedback(android.view.HapticFeedbackConstants.CLOCK_TICK);
+                            showMessageMenu(view, logical, messageText, outgoing);
+                        } else if (!swiping[0]) {
+                            showMessageMenu(view, logical, messageText, outgoing);
+                        }
+                        return true;
+                    case MotionEvent.ACTION_CANCEL:
+                        view.setTranslationX(0);
+                        return false;
+                    default: return false;
+                }
             });
         }
         return bubble;
+    }
+
+    /** Декодирует только экранное превью и держит ограниченное число таких Bitmap. */
+    private Bitmap messageThumbnail(String key, String encoded) {
+        Bitmap cached = messageThumbnails.get(key);
+        if (cached != null && !cached.isRecycled()) return cached;
+        byte[] bytes = Base64.decode(encoded, Base64.NO_WRAP);
+        BitmapFactory.Options bounds = new BitmapFactory.Options();
+        bounds.inJustDecodeBounds = true;
+        BitmapFactory.decodeByteArray(bytes, 0, bytes.length, bounds);
+        int target = Math.max(dp(220), Math.min(dp(420),
+                getResources().getDisplayMetrics().widthPixels));
+        int sample = 1;
+        while (bounds.outWidth / (sample * 2) >= target
+                && bounds.outHeight / (sample * 2) >= target) {
+            sample *= 2;
+        }
+        BitmapFactory.Options options = new BitmapFactory.Options();
+        options.inSampleSize = sample;
+        options.inPreferredConfig = Bitmap.Config.RGB_565;
+        Bitmap decoded = BitmapFactory.decodeByteArray(bytes, 0, bytes.length, options);
+        if (decoded != null) messageThumbnails.put(key, decoded);
+        return decoded;
     }
 
     /** Цитата над телом сообщения. */
@@ -3546,10 +4288,15 @@ public final class MainActivity extends Activity implements Events.Listener {
         ChatPage entry = pages.get(conversation);
         for (int i = 0; i < ids.length(); i++) {
             String id = ids.optString(i);
-            View found = messages.findViewWithTag(id);
-            if (found != null) messages.removeView(found);
             if (entry != null) {
-                entry.bubbles.removeIf(bubble -> id.equals(bubble.getTag()));
+                entry.timeline.removeIf(item -> id.equals(item.id));
+            }
+        }
+        if (entry != null) {
+            normalizeSeparators(entry.timeline);
+            regroupTimeline(entry.timeline);
+            if (conversation.equals(conversations.get(currentPeer))) {
+                messageListAdapter.submit(entry.timeline);
             }
         }
     }
@@ -3567,7 +4314,9 @@ public final class MainActivity extends Activity implements Events.Listener {
             renderPeers();
             toast("Чат удалён");
         } else {
-            if (conversation.equals(conversations.get(currentPeer))) messages.removeAllViews();
+            if (conversation.equals(conversations.get(currentPeer))) {
+                messageListAdapter.submit(java.util.Collections.emptyList());
+            }
             toast("Переписка очищена");
         }
     }
@@ -3577,25 +4326,124 @@ public final class MainActivity extends Activity implements Events.Listener {
     private String replyId;
     private String replyText;
 
-    private void showMessageMenu(String id, String text, boolean outgoing) {
-        // Просить об удалении можно только своё: чужую копию мы не
-        // контролируем, и пункт обещал бы обратное.
-        CharSequence[] items = outgoing
-                ? new CharSequence[]{getString(R.string.reply), getString(R.string.copy),
-                                     getString(R.string.delete_mine), getString(R.string.delete_both)}
-                : new CharSequence[]{getString(R.string.reply), getString(R.string.copy),
-                                     getString(R.string.delete_mine)};
+    private void showMessageMenu(View anchor, String id, String text, boolean outgoing) {
+        HorizontalScrollView scroll = new HorizontalScrollView(this);
+        scroll.setHorizontalScrollBarEnabled(false);
+        scroll.setFillViewport(false);
+        scroll.setBackgroundResource(R.drawable.card_flat);
+        LinearLayout actions = new LinearLayout(this);
+        actions.setOrientation(LinearLayout.HORIZONTAL);
+        actions.setPadding(dp(6), dp(5), dp(6), dp(5));
+        scroll.addView(actions);
+        PopupWindow popup = new PopupWindow(scroll,
+                Math.min(getResources().getDisplayMetrics().widthPixels - dp(24), dp(340)),
+                dp(52), true);
+        popup.setBackgroundDrawable(new android.graphics.drawable.ColorDrawable(Color.TRANSPARENT));
+        popup.setOutsideTouchable(true);
+        popup.setElevation(dp(10));
+        addMessageAction(actions, popup, getString(R.string.reply), () -> setReply(id, text));
+        addMessageAction(actions, popup, getString(R.string.copy), () -> copyToClipboard(text, "Скопировано"));
+        addMessageAction(actions, popup, getString(R.string.delete_mine), () -> confirmDelete(id, false));
+        if (outgoing) addMessageAction(actions, popup, getString(R.string.delete_both),
+                () -> confirmDelete(id, true));
+        int[] location = new int[2];
+        anchor.getLocationOnScreen(location);
+        int screenHeight = getResources().getDisplayMetrics().heightPixels;
+        int y = location[1] + anchor.getHeight() + dp(4);
+        if (y + dp(52) > screenHeight - dp(20)) y = location[1] - dp(56);
+        int x = Math.max(dp(12), Math.min(location[0],
+                getResources().getDisplayMetrics().widthPixels - popup.getWidth() - dp(12)));
+        popup.showAtLocation(getWindow().getDecorView(), Gravity.TOP | Gravity.START, x, y);
+    }
 
-        new AlertDialog.Builder(this)
-                .setItems(items, (dialog, which) -> {
-                    switch (which) {
-                        case 0: setReply(id, text); break;
-                        case 1: copyToClipboard(text, "Скопировано"); break;
-                        case 2: confirmDelete(id, false); break;
-                        default: confirmDelete(id, true); break;
-                    }
-                })
-                .show();
+    private void addMessageAction(LinearLayout actions, PopupWindow popup, String label, Runnable action) {
+        Button button = new Button(this);
+        button.setText(label);
+        button.setAllCaps(false);
+        button.setTextSize(12);
+        button.setTextColor(themeText());
+        button.setBackgroundColor(Color.TRANSPARENT);
+        button.setMinWidth(0);
+        button.setMinimumWidth(0);
+        button.setOnClickListener(v -> { popup.dismiss(); action.run(); });
+        actions.addView(button);
+    }
+
+    private void showCalculator(View anchor) {
+        LinearLayout panel = new LinearLayout(this);
+        panel.setOrientation(LinearLayout.VERTICAL);
+        panel.setPadding(dp(12), dp(12), dp(12), dp(12));
+        panel.setBackgroundResource(R.drawable.card_flat);
+        EditText expression = new EditText(this);
+        expression.setSingleLine(true);
+        expression.setHint("2 × (3 + 4)");
+        expression.setTextColor(themeText());
+        expression.setTextSize(16);
+        panel.addView(expression);
+        TextView result = new TextView(this);
+        result.setTextSize(18);
+        result.setTextColor(themeText());
+        result.setGravity(Gravity.END);
+        result.setPadding(0, dp(8), 0, dp(8));
+        panel.addView(result);
+        android.widget.GridLayout keys = new android.widget.GridLayout(this);
+        keys.setColumnCount(4);
+        panel.addView(keys);
+        Button insert = new Button(this);
+        insert.setText("Вставить результат");
+        insert.setAllCaps(false);
+        panel.addView(insert);
+        Runnable update = () -> {
+            try {
+                result.setText(Calculator.evaluate(expression.getText().toString()));
+                insert.setEnabled(true);
+            } catch (IllegalArgumentException error) {
+                result.setText(error.getMessage());
+                insert.setEnabled(false);
+            }
+        };
+        expression.addTextChangedListener(new android.text.TextWatcher() {
+            @Override public void beforeTextChanged(CharSequence s, int start, int count, int after) {}
+            @Override public void onTextChanged(CharSequence s, int start, int before, int count) { update.run(); }
+            @Override public void afterTextChanged(android.text.Editable s) {}
+        });
+        for (String symbol : new String[]{"7","8","9","/","4","5","6","*",
+                "1","2","3","-","0",".","(",")","C","⌫","+","="}) {
+            Button key = new Button(this);
+            key.setText(symbol);
+            key.setAllCaps(false);
+            key.setTextSize(15);
+            android.widget.GridLayout.LayoutParams params = new android.widget.GridLayout.LayoutParams();
+            params.width = dp(56); params.height = dp(42);
+            key.setLayoutParams(params);
+            key.setOnClickListener(v -> {
+                if ("C".equals(symbol)) expression.setText("");
+                else if ("⌫".equals(symbol)) {
+                    String value = expression.getText().toString();
+                    if (!value.isEmpty()) expression.setText(value.substring(0, value.length() - 1));
+                } else if (!"=".equals(symbol)) expression.append(symbol);
+                update.run();
+            });
+            keys.addView(key);
+        }
+        PopupWindow popup = new PopupWindow(panel, dp(260), ViewGroup.LayoutParams.WRAP_CONTENT, true);
+        popup.setBackgroundDrawable(new android.graphics.drawable.ColorDrawable(Color.TRANSPARENT));
+        popup.setOutsideTouchable(true);
+        popup.setElevation(dp(12));
+        insert.setOnClickListener(v -> {
+            int at = composer.getSelectionStart();
+            int to = composer.getSelectionEnd();
+            if (at < 0) at = composer.length();
+            if (to < at) to = at;
+            composer.getText().replace(at, to, result.getText());
+            popup.dismiss();
+            composer.requestFocus();
+        });
+        update.run();
+        int[] position = new int[2];
+        anchor.getLocationOnScreen(position);
+        popup.showAtLocation(getWindow().getDecorView(), Gravity.BOTTOM | Gravity.START,
+                Math.max(dp(8), position[0] - dp(8)), dp(90));
     }
 
     /**
@@ -3762,18 +4610,19 @@ public final class MainActivity extends Activity implements Events.Listener {
         String conversation = conversations.get(device);
         ChatPage page = TextUtils.isEmpty(conversation) ? null : pages.get(conversation);
         if (page == null) return images;
-        for (View item : page.bubbles) collectImages(item, images);
-        return images;
-    }
-
-    private void collectImages(View view, List<Bitmap> images) {
-        Object image = view.getTag(R.id.message_image_tag);
-        if (image instanceof Bitmap && !images.contains(image)) images.add((Bitmap) image);
-        if (!(view instanceof ViewGroup)) return;
-        ViewGroup group = (ViewGroup) view;
-        for (int i = 0; i < group.getChildCount(); i++) {
-            collectImages(group.getChildAt(i), images);
+        for (TimelineItem item : page.timeline) {
+            if (item.separator) continue;
+            JSONObject content = parseContent(item.body);
+            if (!"image".equals(content.optString("type"))) continue;
+            String encoded = content.optString("data");
+            String key = content.optString("id");
+            if (key.isEmpty()) key = Integer.toHexString(encoded.hashCode());
+            try {
+                Bitmap thumbnail = messageThumbnail(key, encoded);
+                if (thumbnail != null) images.add(thumbnail);
+            } catch (RuntimeException ignored) {}
         }
+        return images;
     }
 
     private void showMediaGallery(String device) {
@@ -3926,6 +4775,9 @@ public final class MainActivity extends Activity implements Events.Listener {
         // находится обходом ленты, а не по номеру, выданному при сборке.
         play.setTag(R.id.voice_starter_tag,
                 (Runnable) () -> playVoice(content, play, track, time, seconds));
+        // Обычный tag связывает видимую кнопку с моделью сообщения. После
+        // виртуализации соседнее голосовое может ещё не иметь View.
+        play.setTag(content.optString("id"));
         play.setOnClickListener(v -> playVoice(content, play, track, time, seconds));
         row.addView(play);
         row.addView(track);
@@ -4031,11 +4883,9 @@ public final class MainActivity extends Activity implements Events.Listener {
         for (int id : group) {
             Button button = findViewById(id);
             boolean on = id == active;
-            button.setBackgroundTintList(ColorStateList.valueOf(
-                    on ? accentColor() : Color.argb(255, 26, 26, 26)));
-            button.setTextColor(on
-                    ? (Color.luminance(accentColor()) > .55 ? Color.BLACK : Color.WHITE)
-                    : getColor(R.color.valanium_muted));
+            button.setBackgroundTintList(null);
+            button.setBackground(on ? selectionBackground() : quietControlBackground());
+            button.setTextColor(on ? accentForLabel() : getColor(R.color.valanium_muted));
         }
     }
 
@@ -4257,12 +5107,56 @@ public final class MainActivity extends Activity implements Events.Listener {
     /** Останавливает то, что играет сейчас: два голосовых разом — это каша. */
     /** Голосовое, идущее в ленте следом за этим. {@code null} — оно последнее. */
     private Runnable nextVoiceAfter(View current) {
+        Object currentTag = current.getTag();
+        String currentId = currentTag instanceof String ? (String) currentTag : "";
+        String conversation = conversations.get(currentPeer);
+        if (TextUtils.isEmpty(conversation) && currentPeer != null) {
+            conversation = pendingPageKey(currentPeer);
+        }
+        ChatPage entry = conversation == null ? null : pages.get(conversation);
+        if (entry != null && !currentId.isEmpty()) {
+            boolean passedCurrent = false;
+            for (int position = 0; position < entry.timeline.size(); position++) {
+                TimelineItem item = entry.timeline.get(position);
+                if (item.separator) continue;
+                JSONObject content = parseContent(item.body);
+                if (!passedCurrent) {
+                    passedCurrent = currentId.equals(content.optString("id"));
+                    continue;
+                }
+                if (!"voice".equals(content.optString("type"))) continue;
+                final int targetPosition = position;
+                final String targetId = content.optString("id");
+                return () -> startVirtualizedVoice(targetPosition, targetId);
+            }
+            return null;
+        }
+
+        // Старые голосовые без id: безопасный запасной путь внутри видимой
+        // области. Такие сообщения нельзя надёжно сопоставить с моделью.
         List<View> buttons = new ArrayList<>();
-        collectVoiceButtons(messages, buttons);
+        collectVoiceButtons(messagesList, buttons);
         int index = buttons.indexOf(current);
         if (index < 0 || index + 1 >= buttons.size()) return null;
         Object starter = buttons.get(index + 1).getTag(R.id.voice_starter_tag);
         return starter instanceof Runnable ? (Runnable) starter : null;
+    }
+
+    /** Прокручивает виртуальный список к голосовому и запускает созданную строку. */
+    private void startVirtualizedVoice(int position, String id) {
+        messagesList.smoothScrollToPosition(position);
+        ui.postDelayed(() -> {
+            View target = TextUtils.isEmpty(id) ? null : messagesList.findViewWithTag(id);
+            List<View> buttons = new ArrayList<>();
+            if (target != null) collectVoiceButtons(target, buttons);
+            if (buttons.isEmpty()) collectVoiceButtons(messagesList, buttons);
+            for (View button : buttons) {
+                if (!id.equals(button.getTag())) continue;
+                Object starter = button.getTag(R.id.voice_starter_tag);
+                if (starter instanceof Runnable) ((Runnable) starter).run();
+                return;
+            }
+        }, 320);
     }
 
     private void collectVoiceButtons(View view, List<View> out) {
@@ -4288,6 +5182,10 @@ public final class MainActivity extends Activity implements Events.Listener {
             if (conversation.equals(entry.getValue())) return entry.getKey();
         }
         return null;
+    }
+
+    private static String pendingPageKey(String peer) {
+        return "pending:" + (peer == null ? "" : peer);
     }
 
     private static String shortHex(String hex) {
@@ -4478,7 +5376,7 @@ public final class MainActivity extends Activity implements Events.Listener {
                 .format(new Date(timestamp));
     }
 
-    private View dateSeparator(long timestamp) {
+    private View dateSeparator(long timestamp, View recycled) {
         Calendar now = Calendar.getInstance();
         Calendar then = Calendar.getInstance();
         then.setTimeInMillis(timestamp);
@@ -4493,10 +5391,14 @@ public final class MainActivity extends Activity implements Events.Listener {
                             ? "d MMMM" : "d MMMM yyyy", Locale.getDefault())
                             .format(new Date(timestamp));
         }
+        FrameLayout row = recycled instanceof FrameLayout
+                ? (FrameLayout) recycled : new FrameLayout(this);
+        row.removeAllViews();
+        row.setPadding(0, dp(10), 0, dp(12));
         TextView view = new TextView(this);
         view.setText(label);
         view.setTextColor(getColor(R.color.valanium_dim));
-        view.setTextSize(10);
+        view.setTextSize(11);
         view.setGravity(Gravity.CENTER);
         view.setPadding(dp(12), dp(5), dp(12), dp(5));
         GradientDrawable background = new GradientDrawable();
@@ -4505,13 +5407,11 @@ public final class MainActivity extends Activity implements Events.Listener {
         background.setCornerRadius(dp(999));
         view.setBackground(background);
         view.setTag(dateKey(timestamp));
-        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT);
-        params.gravity = Gravity.CENTER_HORIZONTAL;
-        params.topMargin = dp(10);
-        params.bottomMargin = dp(12);
-        view.setLayoutParams(params);
-        return view;
+        FrameLayout.LayoutParams params = new FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT,
+                Gravity.CENTER_HORIZONTAL);
+        row.addView(view, params);
+        return row;
     }
 
     private boolean sameDay(Calendar left, Calendar right) {
@@ -4519,52 +5419,54 @@ public final class MainActivity extends Activity implements Events.Listener {
                 && left.get(Calendar.DAY_OF_YEAR) == right.get(Calendar.DAY_OF_YEAR);
     }
 
-    private void markTimelineBubble(View bubble, boolean outgoing, long timestamp) {
-        bubble.setTag(R.id.message_direction_tag, outgoing);
-        bubble.setTag(R.id.message_timestamp_tag, timestamp);
-    }
-
-    private View separatorForAppend(List<View> timeline, long timestamp) {
+    private TimelineItem separatorForAppend(List<TimelineItem> timeline, long timestamp) {
         String wanted = dateKey(timestamp);
         for (int i = timeline.size() - 1; i >= 0; i--) {
-            Object tag = timeline.get(i).getTag();
-            if (tag instanceof String && ((String) tag).startsWith("date:")) {
-                return wanted.equals(tag) ? null : dateSeparator(timestamp);
+            TimelineItem item = timeline.get(i);
+            if (item.separator) {
+                return wanted.equals(dateKey(item.timestamp))
+                        ? null : TimelineItem.separator(timestamp);
             }
         }
-        return dateSeparator(timestamp);
+        return TimelineItem.separator(timestamp);
     }
 
     /** Последовательные сообщения одного направления читаются как одна реплика. */
-    private void regroupTimeline(List<View> timeline) {
-        View previous = null;
-        for (View current : timeline) {
-            Object direction = current.getTag(R.id.message_direction_tag);
-            if (!(direction instanceof Boolean)) {
-                if (previous != null) setBubbleBottom(previous, 8);
+    private void regroupTimeline(List<TimelineItem> timeline) {
+        TimelineItem previous = null;
+        for (TimelineItem current : timeline) {
+            if (current.separator) {
+                if (previous != null) previous.bottomMarginDp = 8;
                 previous = null;
                 continue;
             }
             if (previous != null) {
-                boolean sameDirection = direction.equals(
-                        previous.getTag(R.id.message_direction_tag));
-                Object before = previous.getTag(R.id.message_timestamp_tag);
-                Object after = current.getTag(R.id.message_timestamp_tag);
-                boolean closeInTime = before instanceof Long && after instanceof Long
-                        && Math.abs((Long) after - (Long) before) <= 120_000L;
-                setBubbleBottom(previous, sameDirection && closeInTime ? 3 : 8);
+                boolean sameDirection = current.outgoing == previous.outgoing;
+                boolean closeInTime = Math.abs(current.timestamp - previous.timestamp) <= 120_000L;
+                previous.bottomMarginDp = sameDirection && closeInTime ? 3 : 8;
             }
             previous = current;
         }
-        if (previous != null) setBubbleBottom(previous, 8);
+        if (previous != null) previous.bottomMarginDp = 8;
     }
 
-    private void setBubbleBottom(View bubble, int marginDp) {
-        ViewGroup.LayoutParams raw = bubble.getLayoutParams();
-        if (!(raw instanceof LinearLayout.LayoutParams)) return;
-        LinearLayout.LayoutParams params = (LinearLayout.LayoutParams) raw;
-        params.bottomMargin = dp(marginDp);
-        bubble.setLayoutParams(params);
+    /** Убирает разделители, возле которых после удаления не осталось сообщений. */
+    private void normalizeSeparators(List<TimelineItem> timeline) {
+        String previousDate = null;
+        for (int i = 0; i < timeline.size();) {
+            if (!timeline.get(i).separator) {
+                i++;
+                continue;
+            }
+            boolean noMessageAfter = i == timeline.size() - 1 || timeline.get(i + 1).separator;
+            String date = dateKey(timeline.get(i).timestamp);
+            if (noMessageAfter || date.equals(previousDate)) {
+                timeline.remove(i);
+                continue;
+            }
+            previousDate = date;
+            i++;
+        }
     }
 
     /** Кладёт строку в буфер обмена и подтверждает это человеку. */
@@ -4572,6 +5474,8 @@ public final class MainActivity extends Activity implements Events.Listener {
         android.content.ClipboardManager clipboard =
                 (android.content.ClipboardManager) getSystemService(CLIPBOARD_SERVICE);
         clipboard.setPrimaryClip(android.content.ClipData.newPlainText("Valanium", value));
+        getWindow().getDecorView().performHapticFeedback(
+                android.view.HapticFeedbackConstants.KEYBOARD_TAP);
         toast(confirmation);
     }
 
@@ -4681,7 +5585,8 @@ public final class MainActivity extends Activity implements Events.Listener {
      * а невыбранное вовсе без фона: рамка одна, у дорожки.
      */
     private void markActive(Button button, boolean active, int activeBackground, int idleBackground) {
-        button.setBackgroundResource(active ? activeBackground : idleBackground);
+        button.setBackgroundTintList(null);
+        button.setBackground(active ? selectionBackground() : quietControlBackground());
         if (active) {
             // Короткий подъём отмечает выбор. Дольше — и переключение начинает
             // ощущаться медленным.
@@ -4691,13 +5596,35 @@ public final class MainActivity extends Activity implements Events.Listener {
             button.animate().scaleX(1f).scaleY(1f).setDuration(160)
                     .setInterpolator(new android.view.animation.OvershootInterpolator(1.6f))
                     .start();
-            int accent = accentColor();
-            button.setBackgroundTintList(ColorStateList.valueOf(accent));
-            button.setTextColor(Color.luminance(accent) > .55 ? Color.BLACK : Color.WHITE);
+            button.setTextColor(accentForLabel());
         } else {
-            button.setBackgroundTintList(null);
             button.setTextColor(getColor(R.color.valanium_muted));
         }
+    }
+
+    private GradientDrawable selectionBackground() {
+        int accent = accentColor();
+        GradientDrawable selected = new GradientDrawable();
+        selected.setColor(Color.argb("light".equals(themeName()) ? 34 : 48,
+                Color.red(accent), Color.green(accent), Color.blue(accent)));
+        selected.setStroke(dp(1), Color.argb(105,
+                Color.red(accent), Color.green(accent), Color.blue(accent)));
+        selected.setCornerRadius(dp(99));
+        return selected;
+    }
+
+    private GradientDrawable quietControlBackground() {
+        GradientDrawable idle = new GradientDrawable();
+        idle.setColor(Color.argb("light".equals(themeName()) ? 16 : 38,
+                Color.red(themePanel()), Color.green(themePanel()), Color.blue(themePanel())));
+        idle.setCornerRadius(dp(99));
+        return idle;
+    }
+
+    private int accentForLabel() {
+        int accent = accentColor();
+        return !"light".equals(themeName()) && Color.luminance(accent) < .42
+                ? blend(accent, Color.WHITE, .72f) : accent;
     }
 
     /** Иконки разделов приватности — по порядку заголовков в {@link #PRIVACY_SPEC}. */
@@ -5550,7 +6477,7 @@ public final class MainActivity extends Activity implements Events.Listener {
     private void showList(int list) {
         contactList.setVisibility(list == LIST_CHATS ? View.VISIBLE : View.GONE);
         requestList.setVisibility(list == LIST_REQUESTS ? View.VISIBLE : View.GONE);
-        findViewById(R.id.channel_pane)
+        findViewById(R.id.channel_pane_scroll)
                 .setVisibility(list == LIST_CHANNELS ? View.VISIBLE : View.GONE);
         markActive(findViewById(R.id.tab_chats), list == LIST_CHATS,
                 R.drawable.chip_active, R.drawable.chip_idle);
@@ -5838,20 +6765,20 @@ public final class MainActivity extends Activity implements Events.Listener {
     }
 
     private void renderRequests() {
-        requestList.removeAllViews();
+        List<RequestListItem> rows = new ArrayList<>();
         int pending = 0;
         for (Map.Entry<String, JSONObject> entry : directory.entrySet()) {
             if (!"pending".equals(entry.getValue().optString("standing"))) continue;
             pending++;
-            requestList.addView(requestCard(entry.getKey(), entry.getValue()));
+            rows.add(new RequestListItem(entry.getKey(), entry.getValue()));
         }
         ((Button) findViewById(R.id.tab_requests)).setText(
                 pending == 0 ? getString(R.string.requests_label)
                              : getString(R.string.requests_label) + " · " + pending);
         if (pending == 0) {
-            requestList.addView(emptyState(R.drawable.ic_shield,
-                    getString(R.string.requests_none), getString(R.string.requests_none_hint)));
+            rows.add(new RequestListItem(null, null));
         }
+        requestListAdapter.submit(rows);
         renderPeers();
     }
 
