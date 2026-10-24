@@ -1,3 +1,7 @@
+<div align="center">
+  <img src="valanium_anroid.png" alt="Valanium android UI/UX" width="100%" />
+  
+
 # valanium-android
 
 Android-клиент: Java-интерфейс поверх [valanium-core](../valanium-core) через JNI.
