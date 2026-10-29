@@ -11,7 +11,7 @@ name = "valanium"
 crate-type = ["cdylib"]
 
 [dependencies]
-valanium-core = { git = "https://github.com/ifny75/valanium_main", rev = "928aab4773926dc463f635725702c2cd2de09fad" }
+valanium-core = { git = "https://github.com/ifny75/valanium_main", rev = "e282729f51bbd72a0e547b0e19551a9fa962d053" }
 jni = "0.21"
 hex = "0.4"
 # Нужен только для встроенного Tor: он поднимается в своей среде выполнения.
