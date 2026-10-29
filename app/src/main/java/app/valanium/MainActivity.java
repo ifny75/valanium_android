@@ -3173,13 +3173,16 @@ public final class MainActivity extends Activity implements Events.Listener {
         row.removeAllViews();
         row.setPadding(0, 0, 0, dp(item.bottomMarginDp));
         View bubble = buildBubble(item.body, item.outgoing, currentPeer);
-        FrameLayout.LayoutParams params = new FrameLayout.LayoutParams(
-                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT,
-                item.outgoing ? Gravity.END : Gravity.START);
-        params.leftMargin = item.outgoing ? dp(48) : 0;
-        params.rightMargin = item.outgoing ? 0 : dp(48);
-        bubble.setLayoutParams(params);
-        row.addView(bubble);
+        JSONObject content = parseContent(item.body);
+        String id = content.optString("id");
+        String text = content.optString("text");
+        java.util.List<SwipeMessageLayout.Action> actions = new ArrayList<>();
+        if (!id.isEmpty()) actions.add(new SwipeMessageLayout.Action("Действия", "⋯",
+                () -> showMessageMenu(bubble, id, text, item.outgoing)));
+        SwipeMessageLayout swipe = new SwipeMessageLayout(this, bubble, actions, accentColor(), item.outgoing);
+        swipe.setLayoutParams(new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        row.addView(swipe);
         if (created && motionEnabled()) {
             row.setAlpha(0f);
             row.setTranslationY(dp(8));
@@ -4189,42 +4192,7 @@ public final class MainActivity extends Activity implements Events.Listener {
         String logical = content.optString("id");
         if (!logical.isEmpty()) {
             final String messageText = content.optString("text", "");
-            final float[] start = new float[2];
-            final boolean[] swiping = {false};
-            bubble.setOnTouchListener((view, event) -> {
-                switch (event.getActionMasked()) {
-                    case MotionEvent.ACTION_DOWN:
-                        start[0] = event.getX(); start[1] = event.getY();
-                        swiping[0] = false;
-                        return true;
-                    case MotionEvent.ACTION_MOVE:
-                        float dx = event.getX() - start[0];
-                        float dy = event.getY() - start[1];
-                        if (!swiping[0] && Math.abs(dy) > dp(10) && Math.abs(dy) > Math.abs(dx)) {
-                            return false;
-                        }
-                        if (Math.abs(dx) > dp(12) && Math.abs(dx) > Math.abs(dy)) {
-                            swiping[0] = true;
-                            view.getParent().requestDisallowInterceptTouchEvent(true);
-                            view.setTranslationX(Math.max(-dp(64), Math.min(dp(64), dx)));
-                        }
-                        return true;
-                    case MotionEvent.ACTION_UP:
-                        float distance = event.getX() - start[0];
-                        view.animate().translationX(0).setDuration(150).start();
-                        if (swiping[0] && Math.abs(distance) >= dp(48)) {
-                            view.performHapticFeedback(android.view.HapticFeedbackConstants.CLOCK_TICK);
-                            showMessageMenu(view, logical, messageText, outgoing);
-                        } else if (!swiping[0]) {
-                            showMessageMenu(view, logical, messageText, outgoing);
-                        }
-                        return true;
-                    case MotionEvent.ACTION_CANCEL:
-                        view.setTranslationX(0);
-                        return false;
-                    default: return false;
-                }
-            });
+            bubble.setOnClickListener(view -> showMessageMenu(view, logical, messageText, outgoing));
         }
         return bubble;
     }
