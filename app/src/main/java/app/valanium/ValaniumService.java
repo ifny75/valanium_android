@@ -213,9 +213,19 @@ public final class ValaniumService extends Service {
             Notification.Builder builder = Build.VERSION.SDK_INT >= Build.VERSION_CODES.O
                     ? new Notification.Builder(this, MESSAGE_CHANNEL)
                     : new Notification.Builder(this);
+            int mode = getSharedPreferences("notification_privacy", Context.MODE_PRIVATE).getInt("content_mode", 0);
+            if (mode < 0 || mode > 3) mode = 0;
+            boolean showSender = mode == 1 || mode == 3;
+            boolean showText = mode == 2 || mode == 3;
+            String sender = event.optString("sender_device", "");
+            String title = getString(R.string.app_name);
+            if (showSender && sender.matches("[a-fA-F0-9]{64}")) {
+                title = getString(R.string.notification_sender_label) + " · " + sender.substring(0, 8);
+            }
+            if (showText) builder.setContentText(preview).setStyle(new Notification.BigTextStyle().bigText(preview));
             Notification notification = builder
                     .setSmallIcon(android.R.drawable.stat_notify_chat)
-                    .setContentTitle(getString(R.string.app_name))
+                    .setContentTitle(title)
                     .setCategory(Notification.CATEGORY_MESSAGE)
                     .setVisibility(Notification.VISIBILITY_PRIVATE)
                     .setContentIntent(content)

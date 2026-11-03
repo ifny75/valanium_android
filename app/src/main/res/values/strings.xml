@@ -436,4 +436,10 @@
     <string name="hop_auto">Авто</string>
     <string name="hop_switched">Второй узел: %1$s</string>
     <string name="hop_switched_auto">Второй узел выбирается сам</string>
+    <string name="notification_content_mode">Содержимое уведомлений</string>
+    <string name="notification_content_hidden">Скрыто</string>
+    <string name="notification_content_sender">Отправитель</string>
+    <string name="notification_content_text">Текст</string>
+    <string name="notification_content_both">Отправитель и текст</string>
+    <string name="notification_sender_label">Отправитель</string>
 </resources>
