@@ -43,6 +43,15 @@ public class BlurPanel extends FrameLayout {
 
     private Bitmap shot;
     private Canvas shotCanvas;
+    private Bitmap viewport;
+    private Canvas viewportCanvas;
+    private boolean backdropDirty = true;
+    private boolean refreshPosted;
+    private final Runnable refreshBackdrop = () -> {
+        refreshPosted = false;
+        backdropDirty = true;
+        invalidate();
+    };
     private int[] pixels;
     private int[] scratch;
 
@@ -52,6 +61,7 @@ public class BlurPanel extends FrameLayout {
 
     public void setAccent(int color) {
         accent = color;
+        backdropDirty = true;
         invalidate();
     }
 
@@ -63,8 +73,32 @@ public class BlurPanel extends FrameLayout {
     }
 
     public void setSource(View source) {
+        removeCallbacks(refreshBackdrop);
+        refreshPosted = false;
         this.source = source;
+        backdropDirty = true;
         invalidate();
+    }
+
+    /** Coalesce scroll callbacks to at most 30 backdrop refreshes per second. */
+    public void onSourceScrolled() {
+        if (!refreshPosted) {
+            refreshPosted = true;
+            postDelayed(refreshBackdrop, 33);
+        }
+    }
+
+    @Override
+    protected void onDetachedFromWindow() {
+        removeCallbacks(refreshBackdrop);
+        refreshPosted = false;
+        super.onDetachedFromWindow();
+    }
+
+    @Override
+    protected void onLayout(boolean changed, int left, int top, int right, int bottom) {
+        super.onLayout(changed, left, top, right, bottom);
+        if (changed) backdropDirty = true;
     }
 
     @Override
@@ -86,6 +120,8 @@ public class BlurPanel extends FrameLayout {
 
         int small = Math.max(1, width / SCALE);
         int tall = Math.max(1, height / SCALE);
+        boolean resized = shot == null || shot.getWidth() != small || shot.getHeight() != tall;
+        if (backdropDirty || resized) {
         if (shot == null || shot.getWidth() != small || shot.getHeight() != tall) {
             shot = Bitmap.createBitmap(small, tall, Bitmap.Config.ARGB_8888);
             shotCanvas = new Canvas(shot);
@@ -112,22 +148,35 @@ public class BlurPanel extends FrameLayout {
 
         getLocationInWindow(panelLocation);
         behind.getLocationInWindow(sourceLocation);
-        shotCanvas.save();
-        shotCanvas.scale(1f / SCALE, 1f / SCALE);
-        // Оба элемента могут иметь разные отступы внутри корня. Координаты окна
-        // дают точное смещение области панели в локальную систему экрана.
-        shotCanvas.translate(sourceLocation[0] - panelLocation[0],
-                sourceLocation[1] - panelLocation[1]);
+        // Draw with the entire visible viewport as the clip. Drawing the source
+        // into the tiny island clip marks other children quick-rejected, which
+        // can leave their hardware display lists missing during scrolling.
+        int viewportWidth = Math.max(1, (behind.getWidth() + SCALE - 1) / SCALE);
+        int viewportHeight = Math.max(1, (behind.getHeight() + SCALE - 1) / SCALE);
+        if (viewport == null || viewport.getWidth() != viewportWidth
+                || viewport.getHeight() != viewportHeight) {
+            viewport = Bitmap.createBitmap(viewportWidth, viewportHeight, Bitmap.Config.ARGB_8888);
+            viewportCanvas = new Canvas(viewport);
+        }
+        viewport.eraseColor(Color.TRANSPARENT);
+        viewportCanvas.save();
+        viewportCanvas.scale(1f / SCALE, 1f / SCALE);
+        viewportCanvas.translate(-behind.getScrollX(), -behind.getScrollY());
         try {
-            behind.draw(shotCanvas);
+            behind.draw(viewportCanvas);
         } catch (RuntimeException error) {
             // Не отрисовалось — останется просто стекло. Ронять приложение
             // из-за оформления нельзя.
-            shotCanvas.restore();
+            viewportCanvas.restore();
             return;
         }
-        shotCanvas.restore();
+        viewportCanvas.restore();
+        shotCanvas.drawBitmap(viewport,
+                (sourceLocation[0] - panelLocation[0]) / (float) SCALE,
+                (sourceLocation[1] - panelLocation[1]) / (float) SCALE, paint);
         blurShot(small, tall);
+        backdropDirty = false;
+        }
 
         float radius = RADIUS_DP * getResources().getDisplayMetrics().density;
         clip.reset();

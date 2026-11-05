@@ -442,4 +442,5 @@
     <string name="notification_content_text">Текст</string>
     <string name="notification_content_both">Отправитель и текст</string>
     <string name="notification_sender_label">Отправитель</string>
+    <string name="privacy_apply_account">Применить к этому аккаунту</string>
 </resources>
